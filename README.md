@@ -1,0 +1,718 @@
+# embedded-rtp
+
+Real-time audio over RTP for microcontrollers and servers, from one crate.
+It is `no_std`, needs no allocator, uses no floating point, has no
+dependencies and forbids `unsafe`. Besides parsing and writing packets, it
+includes the parts that make audio actually play: the RFC 3550 statistics
+(sequence validation, loss, interarrival jitter), an adaptive reordering
+jitter buffer, click-free loss concealment for L16 audio, and RTCP reports
+with round-trip times.
+
+Other Rust RTP crates either need `std`, need an allocator, or leave the
+jitter buffer to you (see [why a new crate](docs/design.md#why-a-new-crate)).
+This one builds for `thumbv6m-none-eabi` (RP2040 / Raspberry Pi Pico W,
+Cortex-M0+, no FPU) and runs unchanged on a server, so both ends of a link
+share the same implementation. Its first user is an
+intercom: Pico W devices talking to a server over UDP.
+
+## Contents
+
+- [Features](#features)
+- [Status](#status)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [RTCP](#rtcp)
+- [Example: std::net::UdpSocket](#example-stdnetudpsocket)
+- [Sketch: embassy-net on a Pico W](#sketch-embassy-net-on-a-pico-w)
+- [Key concepts](#key-concepts)
+- [Wire format and interop](#wire-format-and-interop)
+- [Memory](#memory)
+- [Performance](#performance)
+- [Testing and conformance](#testing-and-conformance)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [Licence](#licence)
+
+## Features
+
+- **`no_std`, no `alloc`, no floats, no `unsafe`, no dependencies.** MSRV is
+  Rust 1.81.
+- **Sans-IO.** You pass in datagrams and the current time; the crate never
+  touches sockets or clocks. It works the same under embassy, RTIC, tokio or
+  a plain loop, and is deterministic under test.
+- **Fixed-size state.** Every constructor is a `const fn`, so a `Receiver`,
+  `Sender` or `Concealer` can live in a `static`.
+- **Zero copy where it counts.** Parsing borrows from the datagram, playout
+  borrows from the jitter buffer, and `Sender::send_in_place` writes only the
+  header around audio already captured into the packet buffer.
+
+| Module | What it does |
+|---|---|
+| [`packet`](src/packet.rs) | Parse and write RTP packets (RFC 3550 §5), with CSRCs, header extensions and padding. RTP/RTCP demultiplexing on one port (RFC 5761). |
+| [`stats`](src/stats.rs) | RFC 3550 appendix A: sequence validation (A.1), loss (A.3), interarrival jitter (A.8), in integer arithmetic. |
+| [`jitter`](src/jitter.rs) | A reordering, adaptive jitter buffer. Tells loss from silence, bounds latency, drains after delay spikes. |
+| [`Receiver`](src/receiver.rs) / [`Sender`](src/sender.rs) | The above wired together for one incoming and one outgoing stream. This is what most code uses. |
+| [`rtcp`](src/rtcp.rs) | RTCP (RFC 3550 §6): read and write compound packets with SR, RR, SDES and BYE, validated per appendix A.2. Round-trip times from report blocks. |
+| [`l16`](src/l16.rs) | Big-endian PCM16 encode/decode (RFC 3551 §4.5.11) and `Concealer`, which turns playout into samples and fades over lost frames without clicks. |
+| [`profile`](src/profile.rs) | Constants for an intercom format: L16, 16 kHz mono, 20 ms frames, payload type 96. Nothing else depends on them. |
+
+## Status
+
+Version 0.1, in active development. The API may still change.
+
+Done:
+
+- packets, RFC 3550 statistics and RTP/RTCP demultiplexing (milestone 1, #1);
+- jitter buffer, `Receiver` and `Sender` (milestone 2, #2);
+- L16 helpers and click-free loss concealment (#7);
+- RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3).
+
+Next: a server integration guide and mixing-server example
+([#4](https://github.com/jcorrie/embedded-rtp/issues/4)) and a Pico W example
+([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+
+Not supported (yet):
+
+- **No SRTP or SRTCP.** Packets are neither authenticated nor encrypted
+  ([#8](https://github.com/jcorrie/embedded-rtp/issues/8)). Use it on a
+  trusted network or under another layer of protection for now.
+- **L16 only** for decoding and concealment. The payload is opaque to
+  `Receiver` and `Sender`, so you can carry other formats, but G.722 support
+  is still to come ([#12](https://github.com/jcorrie/embedded-rtp/issues/12)).
+- **No echo cancellation** for full duplex
+  ([#9](https://github.com/jcorrie/embedded-rtp/issues/9)).
+- Frames must all have the same duration
+  ([#13](https://github.com/jcorrie/embedded-rtp/issues/13)), and clock drift
+  is corrected by whole frames, not samples
+  ([#10](https://github.com/jcorrie/embedded-rtp/issues/10)).
+- Out of scope: ICE, DTLS, SDP negotiation, RTCP feedback (NACK, PLI and so
+  on), floating-point codecs such as Opus, and multiple streams per
+  `Receiver` (keep one `Receiver` per remote stream).
+
+## Installation
+
+The crate is not published to crates.io. Depend on it from git:
+
+```toml
+[dependencies]
+embedded-rtp = { git = "https://github.com/jcorrie/embedded-rtp" }
+```
+
+Pin a revision (`rev = "..."`) if you need reproducible builds while the API
+is still moving.
+
+## Quick start
+
+Every 20 ms an audio device does two things: send the frame it just captured,
+and play one frame from the far end. In between, it feeds each datagram that
+arrives to the `Receiver`. The example below runs both ends in memory, drops
+one packet on the way, and shows what the receiver plays for it.
+
+```rust
+use embedded_rtp::jitter::{Config, Playout};
+use embedded_rtp::l16::{self, Concealer};
+use embedded_rtp::packet::Packet;
+use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::{Received, Receiver, Sender};
+
+const FRAME_TICKS: u32 = FRAME_SAMPLES as u32; // 320 ticks of the 16 kHz clock = 20 ms
+
+// SSRC, starting sequence number and starting timestamp should be random
+// (RFC 3550 §5.1); `core` has no RNG, so you supply them.
+let mut sender = Sender::new(0x5eed_1234, PAYLOAD_TYPE, FRAME_TICKS, 4_000, 90_000);
+// 8 slots of up to 640 bytes: about 5 KB, enough for 160 ms of buffering.
+let mut receiver = Receiver::<8, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_TICKS, Config::DEFAULT);
+let mut concealer = Concealer::<FRAME_SAMPLES>::new();
+
+let mut wire = [0u8; PACKET_BYTES];
+let mut lost = 0;
+for tick in 0..50u32 {
+    // Send: encode the captured samples as L16 and packetize them.
+    let captured = [1_000i16; FRAME_SAMPLES];
+    let mut payload = [0u8; FRAME_BYTES];
+    l16::encode(&captured, &mut payload);
+    let len = sender.send(&payload, &mut wire).unwrap();
+
+    // Network: packet 20 never arrives.
+    if tick != 20 {
+        let packet = Packet::parse(&wire[..len]).unwrap();
+        // Arrival time in RTP clock ticks; only differences matter.
+        let arrival = tick * FRAME_TICKS;
+        assert_eq!(receiver.receive(&packet, arrival), Received::Accepted);
+    }
+
+    // Play: exactly once per frame period.
+    let playout = receiver.play();
+    if let Playout::Lost { .. } = playout {
+        lost += 1;
+    }
+    if let Some(samples) = concealer.play(playout) {
+        // Hand `samples` (&[i16; 320]) to the DAC, I2S or mixer.
+        assert_eq!(samples.len(), FRAME_SAMPLES);
+    }
+}
+assert_eq!(lost, 1);
+assert_eq!(receiver.counters().concealed, 1);
+```
+
+### Receiving
+
+`Receiver::receive(&packet, arrival)` checks the payload type, tracks the
+SSRC, updates the statistics and buffers the frame. It returns a `Received`
+saying what happened (`Accepted`, `Late`, `Duplicate`, `WrongPayloadType`,
+...); dropped packets are counted, so you can usually ignore it.
+
+`Receiver::play()` returns a `Playout<'_>` that borrows the frame from the
+jitter buffer. `Concealer::play` decodes it into samples, conceals a `Lost`
+frame from the last good one, and returns `None` once there is nothing to
+play. Statistics are available at any time:
+
+```rust
+use embedded_rtp::jitter::Config;
+use embedded_rtp::Receiver;
+
+let mut receiver = Receiver::<8, 640>::new(96, 320, Config::DEFAULT);
+// ... receive and play ...
+let stats = receiver.stats();
+let _jitter_ticks = stats.jitter(); // interarrival jitter, RTP clock ticks
+let _depth = receiver.buffer().depth(); // frames of latency the buffer adds now
+let _target = receiver.buffer().target(); // the depth it is aiming for
+// RTCP report block figures; starts a new reporting interval.
+assert!(receiver.report().is_none()); // nothing received yet
+```
+
+### Sending
+
+`Sender::send(payload, &mut buf)` writes header and payload into `buf` and
+returns the packet length. If you can capture audio straight into the packet
+buffer (on a Pico, by DMA), `send_in_place` writes only the 12-byte header in
+front of it and saves the copy. When there is nothing to send (silence
+suppression), call `skip()` instead, once per silent frame period:
+
+```rust
+use embedded_rtp::l16;
+use embedded_rtp::packet::{Packet, HEADER_LEN};
+use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::Sender;
+
+let mut sender = Sender::new(0x5eed_1234, PAYLOAD_TYPE, FRAME_SAMPLES as u32, 0, 0);
+let mut buf = [0u8; PACKET_BYTES];
+
+// Capture into the buffer after the header, then write only the header.
+let samples = [0i16; FRAME_SAMPLES];
+l16::encode(&samples, &mut buf[HEADER_LEN..]);
+let len = sender.send_in_place(&mut buf, FRAME_BYTES).unwrap();
+assert_eq!(len, PACKET_BYTES);
+
+// Two silent frame periods: nothing is sent.
+sender.skip();
+sender.skip();
+
+// The next packet keeps the sequence going, jumps the timestamp by the
+// silence, and sets the marker bit to start a new talkspurt.
+let len = sender.send_in_place(&mut buf, FRAME_BYTES).unwrap();
+let header = Packet::parse(&buf[..len]).unwrap().header;
+assert_eq!(header.sequence, 1);
+assert_eq!(header.timestamp, 3 * FRAME_SAMPLES as u32);
+assert!(header.marker);
+```
+
+## RTCP
+
+RTCP travels on the same port as RTP (`packet::is_rtcp` tells them apart).
+Every few seconds each side sends a compound packet: a sender report (SR) if
+it is sending, otherwise a receiver report (RR), plus an SDES with its CNAME
+and optionally a display NAME. Report blocks tell the other side how its
+stream is arriving, and the round trip falls out of the SR timestamps a
+receiver echoes back. A BYE (`Writer::goodbye`) says a source is leaving.
+
+`Compound::parse` checks the whole datagram against RFC 3550 appendix A.2
+first, so iterating over it cannot fail. `Writer` appends packets into your
+buffer, each one all or nothing. Times are NTP short format (1/65536 s),
+and each side only needs its own consistent clock; the clocks don't need to
+agree.
+
+```rust
+use embedded_rtp::jitter::Config;
+use embedded_rtp::packet::Packet;
+use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::rtcp::{self, sdes, Compound, Writer};
+use embedded_rtp::{Receiver, Sender};
+
+// NTP times from a local microsecond clock, in full and short form.
+let ntp = rtcp::ntp_from_micros;
+let short = |micros| rtcp::ntp_short(rtcp::ntp_from_micros(micros));
+
+let mut sender = Sender::new(0x5eed_1234, PAYLOAD_TYPE, FRAME_SAMPLES as u32, 0, 0);
+let mut receiver = Receiver::<8, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_SAMPLES as u32, Config::DEFAULT);
+let mut wire = [0u8; PACKET_BYTES];
+for i in 0..50u32 {
+    let len = sender.send(&[0; FRAME_BYTES], &mut wire).unwrap();
+    receiver.receive(&Packet::parse(&wire[..len]).unwrap(), i * FRAME_SAMPLES as u32);
+}
+
+// Sender, at 10.0 s on its clock: a sender report plus its CNAME.
+let mut buf = [0u8; 256];
+let mut writer = Writer::new(&mut buf);
+writer.sender_report(sender.ssrc(), &sender.sender_info(ntp(10_000_000)), &[]).unwrap();
+writer.source_description(sender.ssrc(), &[(sdes::CNAME, b"kitchen@example")]).unwrap();
+let sr = writer.finish().to_vec();
+
+// Receiver, at 3.1 s on its own clock: note the SR...
+for packet in Compound::parse(&sr).unwrap().packets() {
+    if let rtcp::Packet::SenderReport { ssrc, info, .. } = packet {
+        receiver.sender_report(ssrc, &info, short(3_100_000));
+    }
+}
+// ...and at 3.6 s report back, echoing it.
+let block = receiver.report_block(short(3_600_000)).unwrap();
+let mut buf = [0u8; 256];
+let mut writer = Writer::new(&mut buf);
+writer.receiver_report(0x0bad_cafe, &[block]).unwrap();
+writer
+    .source_description(0x0bad_cafe, &[(sdes::CNAME, b"hall@example"), (sdes::NAME, b"Hallway")])
+    .unwrap();
+let rr = writer.finish().to_vec();
+
+// Sender, at 10.7 s: 0.7 s since its SR, of which the receiver held it for
+// 0.5 s, so the round trip is 0.2 s.
+for packet in Compound::parse(&rr).unwrap().packets() {
+    match packet {
+        rtcp::Packet::ReceiverReport { reports, .. } => {
+            for block in reports.filter(|b| b.ssrc == sender.ssrc()) {
+                assert_eq!((block.extended_highest, block.cumulative_lost), (49, 0));
+                let rtt = rtcp::round_trip(short(10_700_000), block.last_sr, block.delay_since_last_sr);
+                assert!((13_106..=13_108).contains(&rtt.unwrap())); // 0.2 × 65536
+            }
+        }
+        rtcp::Packet::SourceDescription(chunks) => {
+            for chunk in chunks {
+                assert_eq!(chunk.name(), Some(&b"Hallway"[..]));
+            }
+        }
+        _ => {}
+    }
+}
+```
+
+## Example: std::net::UdpSocket
+
+A complete sender and receiver over UDP on a server or desktop. The receiver
+drains the socket without blocking, plays one frame per 20 ms tick, and
+notes sender reports arriving on the shared port so its own reports can echo
+them (sending those is as in [RTCP](#rtcp)). It is marked `no_run` because it opens sockets and
+runs forever; it is still compiled as a doctest.
+
+```rust,no_run
+use std::io::ErrorKind;
+use std::net::UdpSocket;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use embedded_rtp::jitter::Config;
+use embedded_rtp::l16::{self, Concealer};
+use embedded_rtp::packet::{self, Packet};
+use embedded_rtp::rtcp::{self, Compound};
+use embedded_rtp::profile::{
+    CLOCK_RATE, FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE,
+};
+use embedded_rtp::{Receiver, Sender};
+
+const FRAME: Duration = Duration::from_millis(20);
+const FRAME_TICKS: u32 = FRAME_SAMPLES as u32;
+
+/// Local time in RTP clock ticks. Truncating to u32 wraps, which is fine:
+/// only differences matter.
+fn rtp_now(start: Instant) -> u32 {
+    (start.elapsed().as_micros() * u128::from(CLOCK_RATE) / 1_000_000) as u32
+}
+
+/// Local time in RTCP's NTP short format, on the same clock.
+fn ntp_now(start: Instant) -> u32 {
+    rtcp::ntp_short(rtcp::ntp_from_micros(start.elapsed().as_micros() as u64))
+}
+
+fn send(socket: UdpSocket, mut capture: impl FnMut(&mut [i16; FRAME_SAMPLES]) -> bool) {
+    // Use random values here in real code.
+    let mut sender = Sender::new(0x1234_5678, PAYLOAD_TYPE, FRAME_TICKS, 0, 0);
+    let mut samples = [0i16; FRAME_SAMPLES];
+    let mut buf = [0u8; PACKET_BYTES];
+    let mut next = Instant::now();
+    loop {
+        if capture(&mut samples) {
+            l16::encode(&samples, &mut buf[packet::HEADER_LEN..]);
+            let len = sender.send_in_place(&mut buf, FRAME_BYTES).unwrap();
+            socket.send(&buf[..len]).unwrap();
+        } else {
+            sender.skip(); // silence: send nothing, keep the clock running
+        }
+        next += FRAME;
+        thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn receive(socket: UdpSocket, mut output: impl FnMut(Option<&[i16; FRAME_SAMPLES]>)) {
+    socket.set_nonblocking(true).unwrap();
+    let mut receiver = Receiver::<16, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_TICKS, Config::DEFAULT);
+    let mut concealer = Concealer::<FRAME_SAMPLES>::new();
+    let mut buf = [0u8; 1500];
+    let start = Instant::now();
+    let mut next = start;
+    loop {
+        // Take everything that has arrived since the last tick.
+        loop {
+            match socket.recv(&mut buf) {
+                Ok(len) => {
+                    let datagram = &buf[..len];
+                    if packet::is_rtcp(datagram) {
+                        // Remember sender reports for our next report block.
+                        if let Ok(compound) = Compound::parse(datagram) {
+                            for packet in compound.packets() {
+                                if let rtcp::Packet::SenderReport { ssrc, info, .. } = packet {
+                                    receiver.sender_report(ssrc, &info, ntp_now(start));
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                    if let Ok(packet) = Packet::parse(datagram) {
+                        receiver.receive(&packet, rtp_now(start));
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        // One frame per tick: audio, concealment, or None for silence.
+        output(concealer.play(receiver.play()));
+
+        next += FRAME;
+        thread::sleep(next.saturating_duration_since(Instant::now()));
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    let rx = UdpSocket::bind("127.0.0.1:5004")?;
+    let tx = UdpSocket::bind("127.0.0.1:0")?;
+    tx.connect("127.0.0.1:5004")?;
+
+    // A 500 Hz square wave, talking for one second in every two.
+    let mut frame = 0u32;
+    thread::spawn(move || {
+        send(tx, |samples| {
+            frame += 1;
+            for (i, s) in samples.iter_mut().enumerate() {
+                *s = if (i / 16) % 2 == 0 { 4_000 } else { -4_000 };
+            }
+            frame % 100 < 50
+        })
+    });
+
+    receive(rx, |samples| match samples {
+        Some(samples) => println!("play {} samples", samples.len()),
+        None => println!("silence"),
+    });
+    Ok(())
+}
+```
+
+Waking up exactly every 20 ms is the caller's job. On a server, drive
+`play()` from the audio device's callback or the mixer's tick rather than
+`thread::sleep`, so playout follows the output clock.
+
+## Sketch: embassy-net on a Pico W
+
+The same loop on a Pico W with [embassy](https://embassy.dev). This is a
+sketch, not a tested example: embassy is not a dependency of this crate, so
+the block is marked `ignore` and is not compiled. A full Pico W example with
+on-device measurements is planned
+([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+
+```rust,ignore
+use embassy_futures::select::{select, Either};
+use embassy_net::udp::UdpSocket;
+use embassy_time::{Duration, Instant, Ticker};
+use embedded_rtp::jitter::Config;
+use embedded_rtp::l16::Concealer;
+use embedded_rtp::packet::{self, Packet, HEADER_LEN};
+use embedded_rtp::profile::{CLOCK_RATE, FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::{Receiver, Sender};
+
+const FRAME_TICKS: u32 = FRAME_SAMPLES as u32;
+
+fn rtp_now() -> u32 {
+    (Instant::now().as_micros() * u64::from(CLOCK_RATE) / 1_000_000) as u32
+}
+
+#[embassy_executor::task]
+async fn audio(socket: UdpSocket<'static>, server: embassy_net::IpEndpoint, seed: u32) {
+    // About 6 KB in all; could equally be statics, since the constructors are const.
+    let mut receiver = Receiver::<8, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_TICKS, Config::DEFAULT);
+    let mut concealer = Concealer::<FRAME_SAMPLES>::new();
+    let mut sender = Sender::new(seed, PAYLOAD_TYPE, FRAME_TICKS, seed as u16, seed);
+    let mut rx = [0u8; PACKET_BYTES + 64];
+    let mut tx = [0u8; PACKET_BYTES];
+    let mut ticker = Ticker::every(Duration::from_millis(20));
+
+    loop {
+        match select(ticker.next(), socket.recv_from(&mut rx)).await {
+            Either::First(()) => {
+                // Send: the microphone DMA has filled tx[HEADER_LEN..] with L16.
+                if mic_frame_ready(&mut tx[HEADER_LEN..]) {
+                    let len = sender.send_in_place(&mut tx, FRAME_BYTES).unwrap();
+                    let _ = socket.send_to(&tx[..len], server).await;
+                } else {
+                    sender.skip();
+                }
+                // Play: one frame to the I2S DAC, or silence.
+                speaker_write(concealer.play(receiver.play()));
+            }
+            Either::Second(Ok((len, _from))) => {
+                let datagram = &rx[..len];
+                // RTCP is handled as in the std example; omitted here.
+                if !packet::is_rtcp(datagram) {
+                    if let Ok(packet) = Packet::parse(datagram) {
+                        receiver.receive(&packet, rtp_now());
+                    }
+                }
+            }
+            Either::Second(Err(_)) => {}
+        }
+    }
+}
+```
+
+`mic_frame_ready` and `speaker_write` stand for your board's audio drivers.
+
+## Key concepts
+
+**Sans-IO and the arrival clock.** The crate never reads a clock. Pass each
+packet's local arrival time to `Receiver::receive` in **RTP clock ticks**
+(for L16 the clock rate is the sample rate, so 16 ticks per millisecond at
+16 kHz), from any origin. Only differences are used, and `u32` wraparound is
+handled, so a truncated microsecond counter scaled to ticks is enough. The
+arrival times feed the RFC 3550 jitter estimate, which sizes the buffer.
+
+**Playout.** Call `Receiver::play()` exactly once per frame period. It returns:
+
+- `Playout::Frame { sequence, payload }`: the next frame, borrowed from the
+  buffer (not copied). The borrow ends before the next `receive`.
+- `Playout::Lost { sequence }`: that frame never arrived but later ones did.
+  Conceal it; `Concealer` repeats the last good frame, fading to half over the
+  first loss and to silence over the second.
+- `Playout::Silence`: nothing to play. The buffer is prefilling, or the
+  sender has stopped sending. `Concealer` fades out whatever was playing.
+
+The buffer tells loss from silence without timestamps: a gap with later
+frames behind it is loss; an empty buffer is silence.
+
+**Silence suppression.** A sender that sends nothing during silence calls
+`Sender::skip()` once per silent frame period. The timestamp keeps advancing,
+the sequence number does not, and the first packet of the next talkspurt
+carries the marker bit, as RFC 3551 §4.1 asks. Receivers see an empty buffer,
+play `Silence`, and prefill again when audio resumes; this is never counted
+as loss.
+
+**Jitter buffer `Config`.** Depths are in frames:
+
+```rust
+use embedded_rtp::jitter::Config;
+
+// The default: start at 2 frames (40 ms at 20 ms per frame), adapt between
+// 1 and 8 (20-160 ms).
+assert_eq!(
+    Config::DEFAULT,
+    Config { initial_depth: 2, min_depth: 1, max_depth: 8 }
+);
+```
+
+After 16 packets the target follows the measured jitter J:
+`clamp(1 + ceil(3·J / frame), min_depth, max_depth)`. A packet more than
+`max_depth` frames ahead pushes the play point forward (bounding latency),
+and if the buffer stays more than two frames above target for about half a
+second, one frame is dropped to bring latency back down. `max_depth` must not
+exceed `SLOTS`, which must be a power of two; a bad configuration in a
+`const` or `static` is a compile error. `receiver.counters()` reports frames
+played, concealed, late, duplicated, drained and more.
+
+## Wire format and interop
+
+The crate is generic over payload type, clock rate and frame size. The
+`profile` module holds the format the intercom uses, which standard
+tools decode as is:
+
+| | |
+|---|---|
+| Payload | L16: signed 16-bit PCM, **big endian**, mono |
+| Clock / sample rate | 16,000 Hz |
+| Packet time | 20 ms: 320 samples, 640 bytes, timestamp step 320 |
+| Payload type | 96 (dynamic) |
+| Packet size | 652 bytes (12-byte header, no CSRCs or extension) |
+| RTCP | same port as RTP (RFC 5761) |
+| Silence | no packets; the next has the marker bit set and a timestamp gap |
+
+In SDP:
+
+```text
+m=audio 5004 RTP/AVP 96
+a=rtpmap:96 L16/16000/1
+a=ptime:20
+```
+
+For example, to listen to a stream sent to port 5004, save a complete SDP
+file (adding `v=0`, `o=`, `s=`, `c=IN IP4 127.0.0.1` and `t=0 0` lines) as
+`stream.sdp` and run:
+
+```sh
+ffplay -protocol_whitelist file,udp,rtp -i stream.sdp
+```
+
+## Memory
+
+Measured with `size_of` on a 64-bit host; the 32-bit RP2040 is the same or
+slightly smaller.
+
+| Item | Bytes |
+|---|---|
+| `Receiver<16, 640>` (server) | 10,472 |
+| `Receiver<8, 640>` (Pico) | 5,304 |
+| `Concealer<320>` | 1,292 (two frames of samples) |
+| `SourceStats` | 40 |
+| `Sender` | 24 |
+| Packet buffer | 652 |
+
+A full-duplex Pico client (8-slot receiver, sender, one packet buffer) needs
+about 6 KB of the RP2040's 264 KB, plus about 1.3 KB for a concealer. A jitter
+buffer takes roughly `SLOTS × (FRAME + 4)` bytes.
+
+## Performance
+
+Host figures on an x86-64 VM; see
+[docs/design.md#performance](docs/design.md#performance) for the breakdown,
+the optimizations behind them and the latency budget.
+
+| Operation | Time |
+|---|---|
+| One frame, one direction: send, parse, receive, play | ~43 ns (381 instructions) |
+| Receive side only: parse, receive, play | ~41 ns |
+| `l16::decode`, 640 bytes to 320 samples | 27 ns (15 ns with AVX2) |
+| `Concealer::play`, no loss | ~30 ns (23 ns with AVX2) |
+| A lost frame, then audio again | ~330 ns (124 ns with AVX2) |
+| RTCP: write SR + report block + SDES / parse it | ~21 ns / ~42 ns |
+
+The hot path makes one payload copy (into the jitter buffer) and no division,
+which matters on the Cortex-M0+: it has no divide instruction. Processing is
+a negligible part of the delay a listener hears. That comes from
+packetization (one 20 ms frame), the jitter buffer (`target` × 20 ms, 40 ms
+to start) and the network.
+
+On a server, build with `-C target-cpu=x86-64-v3` (AVX2) so concealment
+vectorizes.
+
+```sh
+# Criterion benchmarks
+cargo bench --bench hot_path
+cargo bench --bench hot_path -- --save-baseline before   # then, after a change:
+cargo bench --bench hot_path -- --baseline before
+
+# Deterministic per-line instruction counts with Callgrind
+cargo build --release --example profile
+valgrind --tool=callgrind --callgrind-out-file=callgrind.out \
+    target/release/examples/profile
+callgrind_annotate --auto=yes callgrind.out
+```
+
+## Testing and conformance
+
+The tests check the crate against something independent of it, not just its
+own writer against its own reader, since a misreading shared by both would
+pass:
+
+- **RFC diagrams.** Packets are assembled byte by byte from the RFC 3550 §5.1
+  header diagram in every combination of padding, extension and CSRCs, plus
+  random ones. Every truncation and bit flip of valid packets, and 100,000
+  random inputs, must never panic or return a slice outside the input.
+  RTP/RTCP demultiplexing is checked for every payload type.
+- **Simulations with ground truth.** A simulated network drops, duplicates
+  and reorders packets across several sequence number wraps; expected loss
+  figures come from what it actually delivered. Jitter is checked against a
+  floating-point evaluation of the RFC formula, within a proven bound. The
+  jitter buffer runs with drifting clocks, delay spread, stalls and silence
+  suppression, and every decision it makes is checked against what really
+  arrived.
+- **Interop.** ffmpeg's packets parse to the exact audio it was given (also
+  checked from a captured fixture in the default run); ffmpeg decodes our
+  streams, with silences and wraparound, back to the exact audio; GStreamer's
+  RTCP receiver reports about our stream agree with our statistics.
+- **RTCP.** Packets are checked byte for byte against vectors written from
+  the RFC 3550 §6.4–§6.6 diagrams, and each appendix A.2 validity rule is
+  tested on its own. The round-trip arithmetic is checked against the RFC's
+  worked example. ffmpeg's real RTCP parses, and its final sender report
+  counts exactly the stream it sent. GStreamer accepts our sender reports:
+  it echoes them in its receiver reports, giving a loopback round trip
+  under 100 ms.
+- **Concealment.** On a sine wave with random losses and dry spells at every
+  phase, no sample step exceeds the designed bound.
+- **Planted bugs.** Bugs planted by hand (wrong byte order, off-by-one
+  limits, wrong jitter gain and so on) were caught by the suite.
+
+```sh
+cargo test                                               # everything except interop
+cargo test --test interop -- --ignored --test-threads=1  # needs ffmpeg and GStreamer
+cargo build --release --target thumbv6m-none-eabi        # the embedded build
+```
+
+The interop tests are Unix only. On Debian or Ubuntu they need
+`ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good`.
+The code blocks in this README are compiled as doctests. See
+[docs/design.md#testing](docs/design.md#testing) for the full list.
+
+## Roadmap
+
+From the [milestones](docs/design.md#milestones) in the design document:
+
+| Issue | | Priority |
+|---|---|---|
+| [#4](https://github.com/jcorrie/embedded-rtp/issues/4) | Server integration guide and mixing-server example | Next |
+| [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | Pico W example (embassy-net) with on-device measurements | Next |
+| [#8](https://github.com/jcorrie/embedded-rtp/issues/8) | SRTP: authenticate (and encrypt) | High |
+| [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
+| [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
+| [#11](https://github.com/jcorrie/embedded-rtp/issues/11) | Redundant audio (RFC 2198) | Medium |
+| [#12](https://github.com/jcorrie/embedded-rtp/issues/12) | G.722 codec | Low until bandwidth matters |
+| [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
+| [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |
+| [#6](https://github.com/jcorrie/embedded-rtp/issues/6) | Fuzzing | Low |
+
+[docs/design.md](docs/design.md) explains the design: why existing crates
+don't fit, the algorithms, the memory budget, server integration and
+the decisions taken.
+
+## Contributing
+
+Issues and pull requests are welcome. CI runs, and a pull request needs to
+pass:
+
+```sh
+cargo fmt --check
+RUSTFLAGS="-D warnings" cargo clippy --all-targets
+cargo test                                          # on stable and on 1.81 (MSRV)
+cargo build --release --target thumbv6m-none-eabi   # no std, no allocator
+cargo test --test interop -- --ignored --test-threads=1
+```
+
+Keep the library free of dependencies, allocation, floating point and
+`unsafe`, and keep constructors `const`. New behaviour should be tested
+against an independent reference (an RFC, a simulation that knows the right
+answer, or another implementation) rather than by round-tripping through the
+crate's own code.
+
+## Licence
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT licence](LICENSE-MIT), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+licence, shall be dual licensed as above, without any additional terms or
+conditions.

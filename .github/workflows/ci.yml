@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+      - run: cargo test
+
+  # Fails if anything pulls in std or an allocator: the RP2040 target has
+  # neither.
+  embedded:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+      - run: cargo build --target thumbv6m-none-eabi --release
+
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.81
+      - run: cargo test
+
+  # Conformance against independent implementations (tests/interop.rs).
+  interop:
+    runs-on: ubuntu-24.04
+    # ffmpeg pulls in a large dependency tree, and the runner's Ubuntu mirror
+    # has been seen downloading at ~40 KB/s, so the packages and their index
+    # are cached between runs. A cache miss on a slow mirror can still take a
+    # while; anything longer than this is a hang.
+    timeout-minutes: 40
+    env:
+      APT_PACKAGES: ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore cached apt packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-cache
+          key: apt-ubuntu-24.04-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Install ffmpeg and GStreamer
+        run: |
+          mkdir -p ~/apt-cache/archives/partial ~/apt-cache/lists/partial
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+               -o Dir::Cache::archives=$HOME/apt-cache/archives
+               -o Dir::State::lists=$HOME/apt-cache/lists"
+          # Offline from the cache when it holds everything; otherwise fetch.
+          if sudo apt-get $APT install -y --no-install-recommends --no-download $APT_PACKAGES; then
+            echo "Installed from the cache."
+          else
+            sudo apt-get $APT update
+            sudo apt-get $APT install -y --no-install-recommends $APT_PACKAGES
+          fi
+          # Let actions/cache read everything when it saves: apt's lock files
+          # are root-only.
+          sudo chown -R "$USER" ~/apt-cache
+          sudo chmod -R u+r ~/apt-cache
+      - run: cargo test --test interop -- --ignored --test-threads=1

@@ -1,0 +1,27 @@
+[package]
+name = "embedded-rtp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "no_std, allocation-free RTP/RTCP with RFC 3550 statistics and a jitter buffer"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jcorrie/embedded-rtp"
+keywords = ["rtp", "rtcp", "jitter-buffer", "no_std", "embedded"]
+categories = ["embedded", "no-std", "network-programming", "multimedia::audio"]
+# Consumed as a git dependency, not from crates.io.
+publish = false
+
+# No dependencies on purpose: this has to build for a Pico W (thumbv6m, no
+# FPU, no CAS atomics, no allocator) as well as for a server.
+[dependencies]
+
+# Benchmarks only; the library itself stays dependency-free.
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hot_path"
+harness = false
+
+[profile.release]
+debug = "line-tables-only"
