@@ -612,7 +612,8 @@ because a misreading shared by both halves would pass. See issue #1.
 4. Server integration guide and mixing-server example, including server
    performance (#4).
 5. Pico W example (embassy-net) under `examples/`, with on-device
-   measurements (#5).
+   measurements (#5). The example and its benchmark are in
+   `examples/pico-w` and build in CI; the measurements need hardware.
 
 Further work, by priority:
 

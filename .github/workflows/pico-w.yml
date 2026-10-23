@@ -1,0 +1,33 @@
+name: Pico W example
+
+# The example's firmware has to keep building as the crate changes. Hardware
+# testing stays manual (examples/pico-w/README.md).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  # Placeholders: settings are baked in at build time.
+  WIFI_NETWORK: ci
+  WIFI_PASSWORD: ci
+  INTERCOM_SERVER: 192.0.2.1:1234
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/pico-w
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release
+      - run: cargo clippy --release --features listen-only,cpu-load
+      - run: cargo clippy --release --no-default-features --features always-on,rom-intrinsics

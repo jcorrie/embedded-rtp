@@ -1,0 +1,10 @@
+[build]
+target = "thumbv6m-none-eabi"
+
+[target.thumbv6m-none-eabi]
+# Flash and stream defmt logs through a debug probe (another Pico running
+# debugprobe works). Without one, see README.md.
+runner = "probe-rs run --chip RP2040"
+
+[env]
+DEFMT_LOG = "info"

@@ -72,9 +72,13 @@ Done:
 - RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3);
 - SRTP and SRTCP, interoperating with ffmpeg (#8).
 
+A Pico W intercom client and on-device benchmarks are in
+[`examples/pico-w`](examples/pico-w): they build in CI, and are waiting to be
+run on hardware for the measurements in
+[#5](https://github.com/jcorrie/embedded-rtp/issues/5).
+
 Next: a server integration guide and mixing-server example
-([#4](https://github.com/jcorrie/embedded-rtp/issues/4)) and a Pico W example
-([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+([#4](https://github.com/jcorrie/embedded-rtp/issues/4)).
 
 Not supported (yet):
 
@@ -510,11 +514,11 @@ Waking up exactly every 20 ms is the caller's job. On a server, drive
 
 ## Sketch: embassy-net on a Pico W
 
-The same loop on a Pico W with [embassy](https://embassy.dev). This is a
-sketch, not a tested example: embassy is not a dependency of this crate, so
-the block is marked `ignore` and is not compiled. A full Pico W example with
-on-device measurements is planned
-([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+The same loop on a Pico W with [embassy](https://embassy.dev), cut down to
+its shape. embassy is not a dependency of this crate, so the block is marked
+`ignore` and is not compiled here. The full firmware, with I2S microphone and
+amplifier, RTCP and push-to-talk, is
+[`examples/pico-w`](examples/pico-w), which CI builds.
 
 ```rust,ignore
 use embassy_futures::select::{select, Either};
@@ -791,7 +795,7 @@ From the [milestones](docs/design.md#milestones) in the design document:
 | Issue | | Priority |
 |---|---|---|
 | [#4](https://github.com/jcorrie/embedded-rtp/issues/4) | Server integration guide and mixing-server example | Next |
-| [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | Pico W example (embassy-net) with on-device measurements | Next |
+| [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | On-device measurements with the Pico W example ([`examples/pico-w`](examples/pico-w)) | Next: needs hardware |
 | [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
 | [#11](https://github.com/jcorrie/embedded-rtp/issues/11) | Redundant audio (RFC 2198) | Medium |
