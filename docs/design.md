@@ -610,7 +610,7 @@ because a misreading shared by both halves would pass. See issue #1.
 3. Loss concealment and L16 helpers (#7), then RTCP (#3). **Done.**
    SRTP and SRTCP (#8). **Done.**
 4. Server integration guide and mixing-server example, including server
-   performance (#4).
+   performance (#4). **Done**: see `docs/server.md`.
 5. Pico W example (embassy-net) under `examples/`, with on-device
    measurements (#5).
 

@@ -29,6 +29,7 @@ srtp = ["dep:aes", "dep:aes-kw", "dep:ctr", "dep:hmac", "dep:sha1"]
 # Benchmarks only.
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+getrandom = "0.2"
 
 [[bench]]
 name = "hot_path"
@@ -37,6 +38,22 @@ harness = false
 [[bench]]
 name = "srtp"
 harness = false
+required-features = ["srtp"]
+
+[[bench]]
+name = "mixer"
+harness = false
+required-features = ["srtp"]
+
+# The intercom: a mixing server and a desktop client sharing
+# examples/common/intercom.rs. The server's tests run with `cargo test`.
+[[example]]
+name = "mixing_server"
+required-features = ["srtp"]
+test = true
+
+[[example]]
+name = "intercom_client"
 required-features = ["srtp"]
 
 [profile.release]

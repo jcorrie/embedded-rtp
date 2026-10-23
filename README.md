@@ -71,10 +71,11 @@ Done:
 - jitter buffer, `Receiver` and `Sender` (milestone 2, #2);
 - L16 helpers and click-free loss concealment (#7);
 - RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3);
-- SRTP and SRTCP, interoperating with ffmpeg (#8).
+- SRTP and SRTCP, interoperating with ffmpeg (#8);
+- an intercom: mixing server and desktop client examples, with a server
+  guide (#4).
 
-Next: a server integration guide and mixing-server example
-([#4](https://github.com/jcorrie/embedded-rtp/issues/4)) and a Pico W example
+Next: a Pico W example
 ([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
 
 Not supported (yet):
@@ -427,10 +428,19 @@ key per device: see [SRTP](#srtp).
 **Sizing.** About 6 KB of RAM per device for RTP (8-slot receiver), plus
 about 3 KB for SRTP. 16 slots on the server.
 
-Runnable code: [std::net::UdpSocket](#example-stdnetudpsocket) and the
-[Pico W sketch](#sketch-embassy-net-on-a-pico-w). Full examples are
-planned in [#4](https://github.com/jcorrie/embedded-rtp/issues/4) (server)
-and [#5](https://github.com/jcorrie/embedded-rtp/issues/5) (Pico W).
+All of this, runnable: a mixing server and a desktop client, with SRTP and
+a join handshake that delivers fresh keys. See
+[docs/server.md](docs/server.md) to try it:
+
+```sh
+cargo run --release --features srtp --example mixing_server -- \
+    --devices devices.txt
+cargo run --release --features srtp --example intercom_client -- \
+    --server 127.0.0.1:5004 --id kitchen --kek <hex KEK>
+```
+
+A Pico W device is planned in
+[#5](https://github.com/jcorrie/embedded-rtp/issues/5).
 
 ## Example: std::net::UdpSocket
 
@@ -839,7 +849,6 @@ From the [milestones](docs/design.md#milestones) in the design document:
 
 | Issue | | Priority |
 |---|---|---|
-| [#4](https://github.com/jcorrie/embedded-rtp/issues/4) | Server integration guide and mixing-server example | Next |
 | [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | Pico W example (embassy-net) with on-device measurements | Next |
 | [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |

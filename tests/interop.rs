@@ -26,6 +26,10 @@ use embedded_rtp::profile::{CLOCK_RATE, FRAME_SAMPLES, PAYLOAD_TYPE};
 use embedded_rtp::stats::{SeqStatus, SourceStats, MIN_SEQUENTIAL};
 use embedded_rtp::{rtcp, Receiver, Sender};
 
+#[cfg(feature = "srtp")]
+#[path = "../examples/common/intercom.rs"]
+mod intercom;
+
 /// Kills the child if a test fails before cleaning it up itself.
 struct Running(Child);
 
@@ -975,6 +979,262 @@ mod srtp_interop {
         assert!(
             decoded == expected,
             "decrypted audio differs from what was sent"
+        );
+    }
+}
+
+/// The example mixing server (`examples/common/intercom.rs`) with ffmpeg as
+/// a participant, in insecure mode (ffmpeg can't do the example's join
+/// handshake). The server runs in the test over real UDP sockets.
+#[cfg(feature = "srtp")]
+mod intercom_interop {
+    use super::*;
+    use crate::intercom::{Device, Frame, Mixer, Random, TICK_MS};
+    use embedded_rtp::rtcp::Writer;
+
+    fn seeded(seed: u64) -> Random {
+        let mut rng = common::Rng::new(seed);
+        Box::new(move |buf: &mut [u8]| rng.fill(buf))
+    }
+
+    fn frames(samples: &[i16]) -> Vec<Frame> {
+        samples
+            .chunks_exact(FRAME_SAMPLES)
+            .map(|chunk| chunk.try_into().unwrap())
+            .collect()
+    }
+
+    /// The longest run of `heard` that is consecutive frames of `sent`.
+    fn longest_exact_run(heard: &[Frame], sent: &[Frame]) -> usize {
+        let mut best = 0;
+        for start in 0..heard.len() {
+            let Some(j) = sent.iter().position(|f| *f == heard[start]) else {
+                continue;
+            };
+            let run = heard[start..]
+                .iter()
+                .zip(&sent[j..])
+                .take_while(|(h, s)| h == s)
+                .count();
+            best = best.max(run);
+        }
+        best
+    }
+
+    /// Take every datagram waiting on a non-blocking socket.
+    fn drain(socket: &UdpSocket, mut f: impl FnMut(SocketAddr, &mut [u8])) {
+        let mut buf = [0u8; 2048];
+        while let Ok((len, from)) = socket.recv_from(&mut buf) {
+            f(from, &mut buf[..len]);
+        }
+    }
+
+    use std::net::SocketAddr;
+
+    fn bind() -> UdpSocket {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket.set_nonblocking(true).unwrap();
+        socket
+    }
+
+    /// ffmpeg streams known audio into the room in real time; a listening
+    /// device hears it exactly, and every frame it doesn't hear is one the
+    /// server's jitter buffer chose to drop.
+    ///
+    /// Even with `-re`, ffmpeg sends its first half second or so in a
+    /// burst. The server's jitter buffer drops what exceeds its maximum
+    /// depth (`overflow`), and later drops a frame or two to bring latency
+    /// back to target (`drained`), at a moment that varies from run to run.
+    /// So the check is an exact account: everything heard is ffmpeg's audio,
+    /// in order, with no concealment, and the frames missing are exactly
+    /// those the server's counters say it dropped.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpeg_joins_the_room() {
+        let input = test_signal(3 * CLOCK_RATE as usize, 0);
+        let dir = scratch("intercom-ffmpeg-joins");
+        let input_path = dir.join("in.raw");
+        fs::write(&input_path, l16_bytes(&input)).unwrap();
+
+        let server = bind();
+        let server_addr = server.local_addr().unwrap();
+        let listener = bind();
+        let mut mixer = Mixer::new(Default::default(), true, seeded(1));
+        let mut device = Device::new("listener", "Listener", None, seeded(2));
+        let url = format!("rtp://{server_addr}");
+        let ffmpeg = spawn(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-re",
+                "-f",
+                "s16be",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-i",
+                input_path.to_str().unwrap(),
+                "-af",
+                "asetnsamples=n=320", // one 20 ms frame per packet
+                "-c:a",
+                "pcm_s16be",
+                "-payload_type",
+                "96",
+                "-packetsize",
+                "652",
+                "-f",
+                "rtp",
+                &url,
+            ],
+        );
+
+        let start = Instant::now();
+        let now_ms = || start.elapsed().as_millis() as u64;
+        let mut next_tick = start;
+        let mut heard = Vec::new();
+        while start.elapsed() < Duration::from_millis(4_500) {
+            drain(&server, |from, data| {
+                mixer.datagram(from, data, now_ms(), &mut |to, d| {
+                    drop(server.send_to(d, to))
+                });
+            });
+            drain(&listener, |_, data| device.datagram(data, now_ms()));
+            if Instant::now() >= next_tick {
+                let frame = device.tick(now_ms(), None, &mut |d| {
+                    drop(listener.send_to(d, server_addr));
+                });
+                heard.extend(frame);
+                mixer.tick(now_ms(), &mut |to, d| drop(server.send_to(d, to)));
+                next_tick += Duration::from_millis(TICK_MS);
+            }
+            sleep(Duration::from_millis(1));
+        }
+        drop(ffmpeg);
+
+        let sent = frames(&input);
+        let ffmpeg_member = mixer
+            .members()
+            .into_iter()
+            .find(|m| m.name != "Listener")
+            .expect("ffmpeg never joined");
+        let counters = ffmpeg_member.counters;
+
+        // Which of ffmpeg's frames each heard frame is. The first and last
+        // are concealment fading in and out, so not exact.
+        let indexes: Vec<Option<usize>> = heard
+            .iter()
+            .map(|h| sent.iter().position(|s| s == h))
+            .collect();
+        let first = indexes
+            .iter()
+            .position(Option::is_some)
+            .expect("heard none of it");
+        let last = indexes.iter().rposition(Option::is_some).unwrap();
+        let middle: Vec<usize> = indexes[first..=last]
+            .iter()
+            .map(|i| i.expect("a concealed or foreign frame mid-stream"))
+            .collect();
+        assert!(
+            middle.windows(2).all(|w| w[0] < w[1]),
+            "out of order: {middle:?}"
+        );
+        let gaps: usize = middle.windows(2).map(|w| w[1] - w[0] - 1).sum();
+        // Missing: those before the first exact frame (one of which played,
+        // faded in) and the gaps after it. Overflow can strike either side
+        // of the first frame played, so only the total is fixed.
+        assert_eq!(*middle.last().unwrap(), sent.len() - 1, "the end was heard");
+        assert_eq!(
+            middle[0] + gaps,
+            (counters.overflow + counters.drained) as usize + 1,
+            "every missing frame is one the server dropped; server: {counters:?}"
+        );
+        assert_eq!(counters.concealed, 0);
+    }
+
+    /// A device talks into the room; the server's mix, as sent to a
+    /// participant, decodes in ffmpeg to exactly what was said.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpeg_decodes_the_mix() {
+        const FRAMES: usize = 150;
+        let dir = scratch("intercom-ffmpeg-decodes");
+        let port = free_port_pair();
+        let sdp_path = write_sdp(&dir, port);
+        let output_path = dir.join("out.raw");
+        let ffmpeg = spawn(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-protocol_whitelist",
+                "file,udp,rtp",
+                "-i",
+                sdp_path.to_str().unwrap(),
+                "-f",
+                "s16be",
+                "-y",
+                output_path.to_str().unwrap(),
+            ],
+        );
+        wait_until_bound(port);
+
+        let server = bind();
+        let server_addr = server.local_addr().unwrap();
+        let talker_socket = bind();
+        // The participant whose mix goes to ffmpeg: it joins with a receiver
+        // report and passes on every RTP packet it is sent.
+        let relay = bind();
+        let mut buf = [0u8; 256];
+        let mut writer = Writer::new(&mut buf);
+        writer.receiver_report(0xf00d, &[]).unwrap();
+        writer
+            .source_description(0xf00d, &[(rtcp::sdes::CNAME, b"ffmpeg")])
+            .unwrap();
+        relay.send_to(writer.finish(), server_addr).unwrap();
+
+        let mut mixer = Mixer::new(Default::default(), true, seeded(3));
+        let mut talker = Device::new("talker", "Talker", None, seeded(4));
+        let said: Vec<Frame> = (0..FRAMES)
+            .map(|i| {
+                test_signal(FRAME_SAMPLES, i * FRAME_SAMPLES)
+                    .try_into()
+                    .unwrap()
+            })
+            .collect();
+
+        let mut now_ms = 0u64;
+        for tick in 0..FRAMES + 30 {
+            let capture = said.get(tick);
+            talker.tick(now_ms, capture, &mut |d| {
+                drop(talker_socket.send_to(d, server_addr))
+            });
+            sleep(Duration::from_millis(2)); // let the loopback deliver
+            drain(&server, |from, data| {
+                mixer.datagram(from, data, now_ms, &mut |to, d| drop(server.send_to(d, to)));
+            });
+            mixer.tick(now_ms, &mut |to, d| drop(server.send_to(d, to)));
+            sleep(Duration::from_millis(2));
+            drain(&relay, |_, data| {
+                if !packet::is_rtcp(data) {
+                    relay.send_to(data, ("127.0.0.1", port)).unwrap();
+                }
+            });
+            drain(&talker_socket, |_, data| talker.datagram(data, now_ms));
+            now_ms += TICK_MS;
+        }
+        sleep(Duration::from_millis(500));
+        ffmpeg.interrupt();
+
+        let decoded = frames(&l16_samples(&fs::read(&output_path).unwrap()));
+        let run = longest_exact_run(&decoded, &said);
+        assert!(
+            run >= FRAMES - 5,
+            "ffmpeg decoded {} frames, only {run} of {FRAMES} exact in a row",
+            decoded.len()
         );
     }
 }
