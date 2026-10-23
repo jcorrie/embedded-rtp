@@ -48,9 +48,20 @@ fn sum(frames: &[Frame]) -> Frame {
     out
 }
 
+/// Devices borrow their id and name; tests make them `'static`.
+fn leak(s: &str) -> &'static str {
+    Box::leak(s.to_string().into_boxed_str())
+}
+
+fn seed(n: u64) -> [u8; 10] {
+    let mut bytes = [0u8; 10];
+    seeded(n)(&mut bytes);
+    bytes
+}
+
 struct Node {
     addr: SocketAddr,
-    device: Device,
+    device: Device<'static>,
     /// Unplugged: stops ticking and receiving.
     unplugged: bool,
     heard: Vec<Option<Frame>>,
@@ -94,7 +105,7 @@ impl Sim {
         let display = id.to_uppercase();
         self.nodes.push(Node {
             addr: device_addr(n),
-            device: Device::new(id, &display, kek, seeded(n as u64 + 1)),
+            device: Device::new(leak(id), leak(&display), kek, seed(n as u64 + 1)),
             unplugged: false,
             heard: Vec::new(),
         });

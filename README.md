@@ -26,7 +26,7 @@ intercom: Pico W devices talking to a server over UDP.
 - [SRTP](#srtp)
 - [Building an intercom](#building-an-intercom)
 - [Example: std::net::UdpSocket](#example-stdnetudpsocket)
-- [Sketch: embassy-net on a Pico W](#sketch-embassy-net-on-a-pico-w)
+- [Pico W](#pico-w)
 - [Key concepts](#key-concepts)
 - [Wire format and interop](#wire-format-and-interop)
 - [Memory](#memory)
@@ -73,10 +73,9 @@ Done:
 - RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3);
 - SRTP and SRTCP, interoperating with ffmpeg (#8);
 - an intercom: mixing server and desktop client examples, with a server
-  guide (#4).
-
-Next: a Pico W example
-([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+  guide (#4);
+- a Pico W intercom device, built in CI, with per-frame costs counted on
+  ARMv6-M under QEMU (#5). It still needs trying on hardware.
 
 Not supported (yet):
 
@@ -439,8 +438,7 @@ cargo run --release --features srtp --example intercom_client -- \
     --server 127.0.0.1:5004 --id kitchen --kek <hex KEK>
 ```
 
-A Pico W device is planned in
-[#5](https://github.com/jcorrie/embedded-rtp/issues/5).
+The [Pico W](#pico-w) device joins the same server.
 
 ## Example: std::net::UdpSocket
 
@@ -567,69 +565,21 @@ Waking up exactly every 20 ms is the caller's job. On a server, drive
 `play()` from the audio device's callback or the mixer's tick rather than
 `thread::sleep`, so playout follows the output clock.
 
-## Sketch: embassy-net on a Pico W
+## Pico W
 
-The same loop on a Pico W with [embassy](https://embassy.dev). This is a
-sketch, not a tested example: embassy is not a dependency of this crate, so
-the block is marked `ignore` and is not compiled. A full Pico W example with
-on-device measurements is planned
-([#5](https://github.com/jcorrie/embedded-rtp/issues/5)).
+[`examples/pico-w`](examples/pico-w) is a complete intercom device for a
+Raspberry Pi Pico W, built on [embassy](https://embassy.dev). It joins the
+mixing server over Wi-Fi with SRTP and talks while BOOTSEL is held. Audio
+comes from an INMP441 I2S microphone and goes out to a MAX98357A amplifier.
+Its protocol code is the same `Device` the desktop client and the tests
+run. It builds in CI but has not yet been tried on hardware.
 
-```rust,ignore
-use embassy_futures::select::{select, Either};
-use embassy_net::udp::UdpSocket;
-use embassy_time::{Duration, Instant, Ticker};
-use embedded_rtp::jitter::Config;
-use embedded_rtp::l16::Concealer;
-use embedded_rtp::packet::{self, Packet, HEADER_LEN};
-use embedded_rtp::profile::{CLOCK_RATE, FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
-use embedded_rtp::{Receiver, Sender};
-
-const FRAME_TICKS: u32 = FRAME_SAMPLES as u32;
-
-fn rtp_now() -> u32 {
-    (Instant::now().as_micros() * u64::from(CLOCK_RATE) / 1_000_000) as u32
-}
-
-#[embassy_executor::task]
-async fn audio(socket: UdpSocket<'static>, server: embassy_net::IpEndpoint, seed: u32) {
-    // About 6 KB in all; could equally be statics, since the constructors are const.
-    let mut receiver = Receiver::<8, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_TICKS, Config::DEFAULT);
-    let mut concealer = Concealer::<FRAME_SAMPLES>::new();
-    let mut sender = Sender::new(seed, PAYLOAD_TYPE, FRAME_TICKS, seed as u16, seed);
-    let mut rx = [0u8; PACKET_BYTES + 64];
-    let mut tx = [0u8; PACKET_BYTES];
-    let mut ticker = Ticker::every(Duration::from_millis(20));
-
-    loop {
-        match select(ticker.next(), socket.recv_from(&mut rx)).await {
-            Either::First(()) => {
-                // Send: the microphone DMA has filled tx[HEADER_LEN..] with L16.
-                if mic_frame_ready(&mut tx[HEADER_LEN..]) {
-                    let len = sender.send_in_place(&mut tx, FRAME_BYTES).unwrap();
-                    let _ = socket.send_to(&tx[..len], server).await;
-                } else {
-                    sender.skip();
-                }
-                // Play: one frame to the I2S DAC, or silence.
-                speaker_write(concealer.play(receiver.play()));
-            }
-            Either::Second(Ok((len, _from))) => {
-                let datagram = &rx[..len];
-                // RTCP is handled as in the std example; omitted here.
-                if !packet::is_rtcp(datagram) {
-                    if let Ok(packet) = Packet::parse(datagram) {
-                        receiver.receive(&packet, rtp_now());
-                    }
-                }
-            }
-            Either::Second(Err(_)) => {}
-        }
-    }
-}
-```
-
-`mic_frame_ready` and `speaker_write` stand for your board's audio drivers.
+What a device does each frame costs about 280,000 ARMv6-M instructions,
+both directions with SRTP, counted under QEMU in CI
+([`examples/m0-cycles`](examples/m0-cycles)). That's roughly 15 to 18% of
+a 125 MHz Cortex-M0+, almost all of it AES and SHA-1. Without SRTP it is
+under 5,000. `cargo run --release --bin cycles` in `examples/pico-w`
+measures real cycles on a board.
 
 ## Key concepts
 
@@ -772,11 +722,11 @@ to start) and the network.
 On a server, build with `-C target-cpu=x86-64-v3` (AVX2) so concealment
 vectorizes.
 
-SRTP dominates once it's on, almost all of it HMAC-SHA1 over each packet,
-even with the CPU's SHA instructions. On a server that's still about 0.013%
-of a core per stream. On the RP2040 it's the biggest per-frame cost and will
-be measured on hardware in
-[#5](https://github.com/jcorrie/embedded-rtp/issues/5).
+SRTP dominates once it's on. On a server that's mostly HMAC-SHA1, even
+with the CPU's SHA instructions, and still only about 0.013% of a core per
+stream. On a Cortex-M0+, both AES and SHA-1 run in software. A device frame,
+both directions with SRTP, is about 280,000 instructions (see
+[Pico W](#pico-w)), of which AES is about 80%.
 
 ```sh
 # Criterion benchmarks
@@ -849,7 +799,6 @@ From the [milestones](docs/design.md#milestones) in the design document:
 
 | Issue | | Priority |
 |---|---|---|
-| [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | Pico W example (embassy-net) with on-device measurements | Next |
 | [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
 | [#11](https://github.com/jcorrie/embedded-rtp/issues/11) | Redundant audio (RFC 2198) | Medium |

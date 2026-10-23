@@ -79,3 +79,69 @@ jobs:
           sudo chown -R "$USER" ~/apt-cache
           sudo chmod -R u+r ~/apt-cache
       - run: cargo test --all-features --test interop -- --ignored --test-threads=1
+
+  # The Pico W intercom firmware (examples/pico-w). It needs hardware to
+  # run; CI makes sure it builds, configured and not.
+  firmware:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: examples/pico-w
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --bins
+      - run: cargo build --release --features listen-only
+      # Unconfigured, the compiler can tell the device never starts and
+      # drops most of the program; a configured build compiles all of it.
+      - run: cargo build --release
+        env:
+          WIFI_SSID: ci
+          WIFI_PASSWORD: ci
+          SERVER: 192.0.2.1:5004
+          DEVICE_ID: ci
+          DEVICE_NAME: CI
+          DEVICE_KEK: 000102030405060708090a0b0c0d0e0f
+
+  # What a device costs per frame on the Pico's instruction set (ARMv6-M),
+  # counted under QEMU (examples/m0-cycles). Fails over budget.
+  m0-cycles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: examples/m0-cycles
+    env:
+      APT_PACKAGES: qemu-system-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv6m-none-eabi
+          components: rustfmt, clippy
+      - name: Restore cached apt packages
+        uses: actions/cache@v4
+        with:
+          path: ~/apt-cache
+          key: apt-qemu-ubuntu-24.04-${{ hashFiles('.github/workflows/ci.yml') }}
+      - name: Install QEMU
+        run: |
+          mkdir -p ~/apt-cache/archives/partial ~/apt-cache/lists/partial
+          APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30
+               -o Dir::Cache::archives=$HOME/apt-cache/archives
+               -o Dir::State::lists=$HOME/apt-cache/lists"
+          if sudo apt-get $APT install -y --no-install-recommends --no-download $APT_PACKAGES; then
+            echo "Installed from the cache."
+          else
+            sudo apt-get $APT update
+            sudo apt-get $APT install -y --no-install-recommends $APT_PACKAGES
+          fi
+          sudo chown -R "$USER" ~/apt-cache
+          sudo chmod -R u+r ~/apt-cache
+      - run: cargo fmt --check
+      - run: cargo clippy --release
+      - run: cargo run --release

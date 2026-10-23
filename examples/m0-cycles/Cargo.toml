@@ -1,0 +1,26 @@
+[package]
+name = "m0-cycles"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Counts the instructions an intercom device executes per frame, on ARMv6-M under QEMU"
+publish = false
+
+[[bin]]
+name = "m0-cycles"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+embedded-rtp = { path = "../..", features = ["srtp"] }
+cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
+cortex-m-rt = "0.7"
+cortex-m-semihosting = "0.5"
+panic-semihosting = { version = "0.6", features = ["exit"] }
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = 3
+codegen-units = 1

@@ -53,9 +53,9 @@ fn main() {
 
     let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
     socket.connect(server).unwrap();
-    let random: intercom::Random =
-        Box::new(|buf: &mut [u8]| getrandom::getrandom(buf).expect("OS random numbers"));
-    let mut device = Device::new(&id, &name, kek, random);
+    let mut seed = [0u8; 10];
+    getrandom::getrandom(&mut seed).expect("OS random numbers");
+    let mut device = Device::new(&id, &name, kek, seed);
 
     let start = Instant::now();
     let now_ms = || start.elapsed().as_millis() as u64;

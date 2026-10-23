@@ -1,1 +1,3 @@
 /target
+# The firmware and QEMU harness are separate cargo projects.
+/examples/*/target

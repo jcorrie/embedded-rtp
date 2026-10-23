@@ -41,6 +41,9 @@ doing.
 Generate real KEKs with a random source, for example
 `openssl rand -hex 16`, and keep `devices.txt` private.
 
+A Raspberry Pi Pico W can join the same room: see
+[`examples/pico-w`](../examples/pico-w/README.md).
+
 ## The room
 
 - **Mix minus.** Each 20 ms tick, the server plays every participant's

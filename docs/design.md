@@ -356,8 +356,11 @@ behind the `srtp` feature.
   for when it must not.
 - **Cost.** About 0.67 µs to protect and 0.6 µs to unprotect a 652-byte
   packet on the host, mostly HMAC-SHA1 even with SHA instructions. On the
-  RP2040 both AES and SHA-1 run in software. A rough estimate is several
-  percent of the CPU at 50 packets a second each way; #5 measures it.
+  RP2040 both run in software: about 137,000 ARMv6-M instructions per
+  packet each way, 108,000 of them AES (see "On a Cortex-M0+" below). That
+  is roughly 15% of a 125 MHz core for a full-duplex device. If that proves
+  too much, an authentication-only mode (null cipher, about 29,000
+  instructions) is the fallback.
 - Tested against libsrtp's known-answer packets (RTP and SRTCP), the
   RFC 3711 appendix B vectors and OpenSSL's key wrap, and against ffmpeg in
   both directions across the sequence wrap. Every bit flip, wrong key,
@@ -449,7 +452,35 @@ RTCP runs every few seconds, not per frame: writing an SR with one report
 block plus a two-item SDES takes ~21 ns, and parsing and reading it ~42 ns.
 
 On the RP2040 the receive path compiles to a single `memcpy` call and no
-division calls. Measuring cycle counts there needs hardware (milestone 5).
+division calls.
+
+### On a Cortex-M0+
+
+What a Pico W device does each frame, in ARMv6-M instructions. Counted
+under QEMU in CI (`examples/m0-cycles`): the code is compiled for the
+Cortex-M0+ and run on a Cortex-M3 board, which executes it unchanged, with
+each instruction taking 1 ns of virtual time so that SysTick counts
+instructions.
+
+| Operation | Instructions |
+|---|---|
+| L16 encode and RTP header (`send_in_place`) | 1,040 |
+| Parse, receive, play | 1,160 |
+| Concealment: good frame / lost frame then good | 2,440 / 7,480 |
+| SRTP protect, 652 bytes | 137,080 |
+| SRTP unprotect, 662 bytes | 137,440 |
+| SRTP tag check only (a forged packet) | 29,000 |
+| Whole device frame, both directions, SRTP | 279,480 |
+| New SRTP context (key derivation) | 80,320 |
+
+A Cortex-M0+ takes one cycle for most instructions and two for loads,
+stores and taken branches, so cycles are roughly 1.3 to 1.6 times these
+counts. The whole frame is then 3 to 3.6 ms of every 20 ms at 125 MHz,
+about 15 to 18% of the CPU. Without SRTP it would be under 5,000
+instructions. CI fails if the whole frame passes 400,000 instructions.
+`examples/pico-w`'s `cycles` binary runs the same workload on a board and
+reports real cycles, including flash cache misses. Those numbers still
+need recording here.
 
 ### Latency budget
 
@@ -612,7 +643,9 @@ because a misreading shared by both halves would pass. See issue #1.
 4. Server integration guide and mixing-server example, including server
    performance (#4). **Done**: see `docs/server.md`.
 5. Pico W example (embassy-net) under `examples/`, with on-device
-   measurements (#5).
+   measurements (#5). **Built**: `examples/pico-w`, with instruction counts
+   from QEMU. Still to do on hardware: a first run, and real cycle counts
+   from its `cycles` binary.
 
 Further work, by priority:
 

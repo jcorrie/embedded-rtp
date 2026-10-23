@@ -33,7 +33,7 @@ fn seeded(seed: u64) -> Random {
 
 struct Room {
     mixer: Mixer,
-    devices: Vec<(SocketAddr, Device)>,
+    devices: Vec<(SocketAddr, Device<'static>)>,
     now: u64,
     outbox: Vec<(SocketAddr, Vec<u8>)>,
 }
@@ -48,8 +48,10 @@ impl Room {
                 let addr: SocketAddr = format!("10.0.{}.{}:4000", i / 200, i % 200 + 1)
                     .parse()
                     .unwrap();
-                let device =
-                    Device::new(&format!("d{i}"), "d", Some([i as u8; 16]), seeded(i as u64));
+                let id: &'static str = Box::leak(format!("d{i}").into_boxed_str());
+                let mut seed = [0u8; 10];
+                seeded(i as u64)(&mut seed);
+                let device = Device::new(id, "d", Some([i as u8; 16]), seed);
                 (addr, device)
             })
             .collect();

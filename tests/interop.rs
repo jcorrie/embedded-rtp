@@ -997,6 +997,12 @@ mod intercom_interop {
         Box::new(move |buf: &mut [u8]| rng.fill(buf))
     }
 
+    fn seed(n: u64) -> [u8; 10] {
+        let mut bytes = [0u8; 10];
+        seeded(n)(&mut bytes);
+        bytes
+    }
+
     fn frames(samples: &[i16]) -> Vec<Frame> {
         samples
             .chunks_exact(FRAME_SAMPLES)
@@ -1060,7 +1066,7 @@ mod intercom_interop {
         let server_addr = server.local_addr().unwrap();
         let listener = bind();
         let mut mixer = Mixer::new(Default::default(), true, seeded(1));
-        let mut device = Device::new("listener", "Listener", None, seeded(2));
+        let mut device = Device::new("listener", "Listener", None, seed(2));
         let url = format!("rtp://{server_addr}");
         let ffmpeg = spawn(
             "ffmpeg",
@@ -1197,7 +1203,7 @@ mod intercom_interop {
         relay.send_to(writer.finish(), server_addr).unwrap();
 
         let mut mixer = Mixer::new(Default::default(), true, seeded(3));
-        let mut talker = Device::new("talker", "Talker", None, seeded(4));
+        let mut talker = Device::new("talker", "Talker", None, seed(4));
         let said: Vec<Frame> = (0..FRAMES)
             .map(|i| {
                 test_signal(FRAME_SAMPLES, i * FRAME_SAMPLES)

@@ -1,0 +1,7 @@
+[target.thumbv6m-none-eabi]
+# Instruction counting: with -icount shift=0 each instruction takes exactly
+# 1 ns of virtual time, so SysTick counts instructions.
+runner = "qemu-system-arm -machine mps2-an385 -nographic -semihosting-config enable=on,target=native -icount shift=0,align=off,sleep=off -kernel"
+
+[build]
+target = "thumbv6m-none-eabi" # Cortex-M0 / M0+ code
