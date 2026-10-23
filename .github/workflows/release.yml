@@ -11,18 +11,24 @@ name: release
 on:
   push:
     branches: [main]
-  # To retry a release that failed part way.
+  # To retry a release that failed part way. Runs on any other branch
+  # stop at the first job.
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One release run at a time. A run that waits here and is replaced by a
+# newer push loses nothing: the newer run reads the version from main and
+# finds it untagged just the same.
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
   check:
+    # Only main is released, also when run by hand.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
