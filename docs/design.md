@@ -4,14 +4,15 @@ Status: **accepted**. Implementation in progress.
 
 ## Summary
 
-A small RTP/RTCP crate with no dependencies, written for microcontrollers and
+A small RTP/RTCP crate with no dependencies by default, written for microcontrollers and
 usable unchanged on a server. It covers:
 
 - reading and writing packets;
 - the statistics RFC 3550 defines (sequence tracking, loss, interarrival
   jitter);
 - the RTCP basics;
-- a jitter buffer.
+- a jitter buffer;
+- optionally, SRTP and SRTCP to authenticate and encrypt them.
 
 It is `no_std`, needs no allocator and uses no floating point. Everything is
 fixed size and can live in a `static`.
@@ -61,7 +62,9 @@ credit `rtp-rs` and `rtp-types` as API references.
 
 ## Goals
 
-- `#![no_std]`, no `alloc`, `#![forbid(unsafe_code)]`, no dependencies.
+- `#![no_std]`, no `alloc`, `#![forbid(unsafe_code)]`, no dependencies. The
+  one exception is the optional `srtp` feature, which uses audited RustCrypto
+  crates rather than hand-written cryptography.
 - No floating point anywhere. RFC 3550's jitter estimate is already defined
   in integer arithmetic.
 - `const fn` constructors, so all state can sit in a `static` on embedded.
@@ -76,16 +79,18 @@ credit `rtp-rs` and `rtp-types` as API references.
 
 ## Non-goals
 
-- ICE, DTLS, SDP negotiation, or anything else from WebRTC. Keys are
-  pre-shared per device (see SRTP below), not negotiated.
+- ICE, DTLS, SDP negotiation, or anything else from WebRTC. SRTP keys come
+  from the application (see `srtp` below), not from a handshake in the
+  crate.
 - RTCP feedback messages (NACK, PLI, TWCC, REMB).
 - Opus or other floating-point codecs: too heavy for a Cortex-M0+.
 - Multiple streams per session. The caller keeps one `Receiver` per remote
   stream.
 
-Once out of scope, now planned (issues #8–#14):
-- SRTP, authentication first, behind an optional feature using audited
-  RustCrypto crates (#8);
+Once out of scope, now done or planned:
+- SRTP and SRTCP behind an optional feature using audited RustCrypto crates
+  (#8, done);
+- end-to-end key agreement for direct calls (#15);
 - integer codecs, G.722 (#12);
 - sample-level clock-drift correction instead of dropping whole frames (#10);
 - RFC 8285 header extensions, for talker levels (#14).
@@ -100,7 +105,8 @@ embedded-rtp
 ├── jitter     jitter buffer
 ├── receiver   stats + jitter buffer + SSRC handling
 ├── sender     sequence/timestamp/marker bookkeeping
-└── l16        PCM16 encode/decode, simple loss concealment
+├── l16        PCM16 encode/decode, simple loss concealment
+└── srtp       SRTP/SRTCP and key wrap (optional `srtp` feature)
 ```
 
 ### `packet`
@@ -301,6 +307,62 @@ For the intercom, these RTCP messages replace ad-hoc control traffic:
     phase, no sample step exceeds the bound the design implies, and naive
     concealment demonstrably breaks that bound.
 
+### `srtp`
+
+SRTP and SRTCP (RFC 3711) with the default suite, `AES_CM_128_HMAC_SHA1_80`,
+behind the `srtp` feature.
+
+- **Crypto from audited crates.** `aes`, `ctr`, `hmac`, `sha1` and `aes-kw`
+  from RustCrypto, all `no_std` without an allocator. They stay on the
+  releases that support Rust 1.81 (aes 0.8, ctr 0.9, hmac 0.12, sha1 0.10,
+  aes-kw 0.2); newer ones need a newer compiler.
+- **Two contexts per stream direction.** `Outbound` protects one sender's RTP
+  and RTCP; `Inbound` checks and decrypts one remote stream's. Each binds to
+  the first SSRC it sees and rejects others, so one key can't silently serve
+  two streams with confused state.
+- **In place.** `protect_rtp` encrypts the payload (everything after the
+  header, CSRCs and extension) where it lies and appends the 10-byte tag.
+  `unprotect_rtp` returns the plain packet's length for `Packet::parse`.
+  Session keys are derived once per context; the AES key schedule and the
+  keyed HMAC state are kept, so a packet costs one counter-mode pass and one
+  HMAC.
+- **Order of checks when receiving.** Estimate the packet index (RFC 3711
+  appendix A), check the replay window, verify the tag in constant time,
+  and only then update state and decrypt. A packet that fails any step
+  changes nothing.
+- **Replay window** of 64 packets (§3.3.2's minimum), separately for RTP and
+  SRTCP.
+- **No index reuse on send.** `Outbound`'s packet index only moves forward: a
+  sequence number that isn't after the last one is taken as the next
+  rollover. Repeating a sequence number therefore never reuses keystream; the
+  receiver sees a replay.
+- **SRTCP** always encrypts. Authentication-only SRTCP (E flag clear) is
+  rejected rather than accepted untested; nothing in this crate's world
+  sends it. The first SRTCP index is 0, as §3.4 says (libsrtp starts at 1;
+  receivers accept either).
+- **Rekeying.** `rekey` on `Inbound` keeps the previous keys until a packet
+  authenticates under the new ones, so the sender can switch whenever it
+  likes without a gap. No MKI: neither SDES as ffmpeg uses it nor our
+  devices need one.
+- **Keying model.** The crate takes a master key and salt and leaves delivery
+  to the application, but its documentation is firm on one point: a fresh
+  master key per session. A fixed key per device plus a reboot that restarts
+  sequence numbers reuses counter-mode keystream, leaking the XOR of two
+  audio streams (§9.1). The recommended layering: a long-term device secret
+  only authenticates the device; the server issues random session keys on
+  connect (or per call for direct calls), over TLS or wrapped with
+  `srtp::wrap` (AES key wrap with padding, RFC 5649) under a key derived from
+  the device secret. A key-issuing server can decrypt what it keys; #15 is
+  for when it must not.
+- **Cost.** About 0.67 µs to protect and 0.6 µs to unprotect a 652-byte
+  packet on the host, mostly HMAC-SHA1 even with SHA instructions. On the
+  RP2040 both AES and SHA-1 run in software. A rough estimate is several
+  percent of the CPU at 50 packets a second each way; #5 measures it.
+- Tested against libsrtp's known-answer packets (RTP and SRTCP), the
+  RFC 3711 appendix B vectors and OpenSSL's key wrap, and against ffmpeg in
+  both directions across the sequence wrap. Every bit flip, wrong key,
+  replay and out-of-window packet is rejected.
+
 ## Memory
 
 Measured with `size_of` on a 64-bit host. The 32-bit RP2040 is the same or
@@ -315,10 +377,13 @@ slightly smaller.
 | `JitterBuffer<8, 640>` | 5,232 |
 | `SourceStats` | 40 |
 | `Sender` | 24 |
-| Packet buffer | 652 (12 + 640) |
+| Packet buffer | 652 (12 + 640), 662 with SRTP |
+| `srtp::Outbound` | 1,760 (1,040 on the RP2040) |
+| `srtp::Inbound` | 3,536 (2,080 on the RP2040) |
 
 The RP2040 has 264 KB of SRAM. A full-duplex client with an 8-slot receiver,
-a sender and one packet buffer uses about 6 KB.
+a sender and one packet buffer uses about 6 KB, and about 9 KB with SRTP.
+Half of `Inbound` holds the previous keys during a rekey.
 
 ## Performance
 
@@ -543,6 +608,7 @@ because a misreading shared by both halves would pass. See issue #1.
 1. `packet` + `stats` + tests; thumbv6m CI. **Done** (#1).
 2. `jitter` + `receiver` + `sender` + simulation test. **Done** (#2).
 3. Loss concealment and L16 helpers (#7), then RTCP (#3). **Done.**
+   SRTP and SRTCP (#8). **Done.**
 4. Server integration guide and mixing-server example, including server
    performance (#4).
 5. Pico W example (embassy-net) under `examples/`, with on-device
@@ -552,13 +618,13 @@ Further work, by priority:
 
 | Issue | | Priority |
 |---|---|---|
-| #8 | SRTP: authenticate (and encrypt), and SRTCP | High |
 | #9 | Echo handling for full duplex | High for full duplex |
 | #10 | Clock drift by samples, not frames | Medium |
 | #11 | Redundant audio (RFC 2198) | Medium |
 | #12 | G.722 codec | Low until bandwidth matters |
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |
+| #15 | End-to-end key agreement for direct calls | Low until needed |
 | #6 | Fuzzing | Low |
 
 ## Decisions
@@ -570,3 +636,4 @@ Further work, by priority:
 | Codec | Raw 16-bit PCM (L16) only. The payload stays opaque, so a codec can be added later without API changes. |
 | Licence | Dual MIT OR Apache-2.0. |
 | Distribution | Git dependency; not published to crates.io. |
+| Security | SRTP with `AES_CM_128_HMAC_SHA1_80`, optional feature. Fresh session keys from the application; the crate never invents or exchanges keys. |

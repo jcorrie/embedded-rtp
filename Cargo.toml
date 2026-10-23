@@ -11,17 +11,33 @@ categories = ["embedded", "no-std", "network-programming", "multimedia::audio"]
 # Consumed as a git dependency, not from crates.io.
 publish = false
 
-# No dependencies on purpose: this has to build for a Pico W (thumbv6m, no
-# FPU, no CAS atomics, no allocator) as well as for a server.
+# No dependencies by default: this has to build for a Pico W (thumbv6m, no
+# FPU, no CAS atomics, no allocator) as well as for a server. The optional
+# ones are audited RustCrypto crates for SRTP, all no_std without an
+# allocator. They stay on the releases that support the crate's MSRV.
 [dependencies]
+aes = { version = "0.8.4", default-features = false, optional = true }
+aes-kw = { version = "0.2.1", default-features = false, optional = true }
+ctr = { version = "0.9.2", default-features = false, optional = true }
+hmac = { version = "0.12.1", default-features = false, optional = true }
+sha1 = { version = "0.10.6", default-features = false, optional = true }
 
-# Benchmarks only; the library itself stays dependency-free.
+[features]
+# SRTP and SRTCP (RFC 3711) in the `srtp` module.
+srtp = ["dep:aes", "dep:aes-kw", "dep:ctr", "dep:hmac", "dep:sha1"]
+
+# Benchmarks only.
 [dev-dependencies]
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "hot_path"
 harness = false
+
+[[bench]]
+name = "srtp"
+harness = false
+required-features = ["srtp"]
 
 [profile.release]
 debug = "line-tables-only"

@@ -19,10 +19,12 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets
+      - run: cargo clippy --all-targets --all-features
       - run: cargo test
+      - run: cargo test --all-features
 
-  # Fails if anything pulls in std or an allocator: the RP2040 target has
-  # neither.
+  # Fails if anything pulls in std or an allocator, SRTP's crypto crates
+  # included: the RP2040 target has neither.
   embedded:
     runs-on: ubuntu-latest
     steps:
@@ -31,6 +33,7 @@ jobs:
         with:
           targets: thumbv6m-none-eabi
       - run: cargo build --target thumbv6m-none-eabi --release
+      - run: cargo build --target thumbv6m-none-eabi --release --all-features
 
   msrv:
     runs-on: ubuntu-latest
@@ -38,6 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.81
       - run: cargo test
+      - run: cargo test --all-features
 
   # Conformance against independent implementations (tests/interop.rs).
   interop:
@@ -74,4 +78,4 @@ jobs:
           # are root-only.
           sudo chown -R "$USER" ~/apt-cache
           sudo chmod -R u+r ~/apt-cache
-      - run: cargo test --test interop -- --ignored --test-threads=1
+      - run: cargo test --all-features --test interop -- --ignored --test-threads=1

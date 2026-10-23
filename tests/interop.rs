@@ -754,3 +754,227 @@ fn ffmpeg_stream_plays_through_receiver_unchanged() {
     while take(&mut receiver) {}
     assert_eq!(played, input);
 }
+
+/// SRTP (RFC 3711) against ffmpeg's implementation, in both directions, with
+/// the default suite and one master key for RTP and RTCP as SDES sets up.
+/// Both streams start just below the sequence number wrap, so the rollover
+/// counter, which the tag covers, has to agree too.
+#[cfg(feature = "srtp")]
+mod srtp_interop {
+    use super::*;
+    use embedded_rtp::srtp::{Inbound, MasterKey, Outbound, RTP_OVERHEAD};
+
+    fn master_key() -> MasterKey {
+        let mut bytes = [0u8; 30];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(37).wrapping_add(11);
+        }
+        MasterKey::from_bytes(&bytes)
+    }
+
+    /// Standard base64, as SDP's `inline:` and ffmpeg's `srtp_*_params` take.
+    fn base64(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk
+                .iter()
+                .enumerate()
+                .fold(0u32, |n, (i, &b)| n | u32::from(b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn base64_matches_rfc4648() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// ffmpeg encrypts known audio; we must authenticate and decrypt every
+    /// packet back to it exactly, and its SRTCP sender reports too.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpeg_sends_srtp_we_decrypt() {
+        let input = test_signal(2 * CLOCK_RATE as usize, 0); // two seconds
+        let dir = scratch("ffmpeg-srtp-send");
+        let input_path = dir.join("in.raw");
+        fs::write(&input_path, l16_bytes(&input)).unwrap();
+
+        let port = free_port_pair();
+        let rtp = UdpSocket::bind(("127.0.0.1", port)).unwrap();
+        let rtcp_socket = UdpSocket::bind(("127.0.0.1", port + 1)).unwrap();
+        rtp.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        rtcp_socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let params = base64(&master_key().to_bytes());
+        let url = format!("srtp://127.0.0.1:{port}");
+        let ffmpeg = spawn(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16be",
+                "-ar",
+                "16000",
+                "-ac",
+                "1",
+                "-i",
+                input_path.to_str().unwrap(),
+                "-c:a",
+                "pcm_s16be",
+                "-payload_type",
+                "96",
+                "-seq",
+                "65520",
+                "-rtpflags",
+                "send_bye",
+                "-srtp_out_suite",
+                "AES_CM_128_HMAC_SHA1_80",
+                "-srtp_out_params",
+                &params,
+                "-f",
+                "rtp",
+                &url,
+            ],
+        );
+
+        let mut inbound = Inbound::new(&master_key());
+        let mut received = Vec::new();
+        let mut sequences = Vec::new();
+        let mut reports = Vec::new();
+        let mut quiet_since = Instant::now();
+        let mut buf = [0u8; 2048];
+        while quiet_since.elapsed() < Duration::from_secs(2) {
+            if let Ok((len, _)) = rtp.recv_from(&mut buf) {
+                let plain = inbound
+                    .unprotect_rtp(&mut buf[..len])
+                    .unwrap_or_else(|e| panic!("ffmpeg's SRTP rejected: {e:?}"));
+                let packet = Packet::parse(&buf[..plain]).unwrap();
+                sequences.push(packet.header.sequence);
+                received.extend(l16_samples(packet.payload));
+                quiet_since = Instant::now();
+            }
+            if let Ok((len, _)) = rtcp_socket.recv_from(&mut buf) {
+                let plain = inbound
+                    .unprotect_rtcp(&mut buf[..len])
+                    .unwrap_or_else(|e| panic!("ffmpeg's SRTCP rejected: {e:?}"));
+                reports.push(buf[..plain].to_vec());
+                quiet_since = Instant::now();
+            }
+        }
+        drop(ffmpeg);
+
+        assert!(
+            sequences.contains(&65535) && sequences.contains(&0),
+            "stream should cross the sequence wrap: {sequences:?}"
+        );
+        assert_eq!(received, input, "decrypted audio differs");
+
+        let mut last_count = None;
+        for report in &reports {
+            for packet in rtcp::Compound::parse(report).unwrap().packets() {
+                if let rtcp::Packet::SenderReport { info, .. } = packet {
+                    last_count = Some(info.packet_count);
+                }
+            }
+        }
+        assert_eq!(
+            last_count,
+            Some(sequences.len() as u32),
+            "final SR counts every packet"
+        );
+    }
+
+    /// We encrypt; ffmpeg, keyed from the SDP's `a=crypto` line (RFC 4568),
+    /// must decrypt back to the exact audio, across losses, reordering and
+    /// the sequence wrap.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn ffmpeg_decrypts_our_srtp() {
+        const FRAMES: usize = 150;
+        let dropped = [40, 41, 100];
+        let dir = scratch("ffmpeg-srtp-receive");
+        let port = free_port_pair();
+        let sdp_path = dir.join("in.sdp");
+        let output_path = dir.join("out.raw");
+        fs::write(
+            &sdp_path,
+            format!(
+                "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=embedded-rtp\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+                 m=audio {port} RTP/SAVP 96\r\na=rtpmap:96 L16/16000/1\r\na=ptime:20\r\n\
+                 a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
+                base64(&master_key().to_bytes())
+            ),
+        )
+        .unwrap();
+
+        let ffmpeg = spawn(
+            "ffmpeg",
+            &[
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-protocol_whitelist",
+                "file,udp,rtp,srtp",
+                "-i",
+                sdp_path.to_str().unwrap(),
+                "-f",
+                "s16be",
+                "-y",
+                output_path.to_str().unwrap(),
+            ],
+        );
+        wait_until_bound(port);
+
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut sender = Sender::new(0x5eed_cafe, PAYLOAD_TYPE, FRAME_SAMPLES as u32, 65_500, 0);
+        let mut outbound = Outbound::new(&master_key());
+        let frames: Vec<Vec<i16>> = (0..FRAMES)
+            .map(|i| test_signal(FRAME_SAMPLES, i * FRAME_SAMPLES))
+            .collect();
+        let mut wire: Vec<Vec<u8>> = frames
+            .iter()
+            .map(|frame| {
+                let mut buf = vec![0u8; packet::HEADER_LEN + 2 * FRAME_SAMPLES + RTP_OVERHEAD];
+                let len = sender.send(&l16_bytes(frame), &mut buf).unwrap();
+                let len = outbound.protect_rtp(&mut buf, len).unwrap();
+                buf.truncate(len);
+                buf
+            })
+            .collect();
+        wire.swap(70, 71);
+        let order: Vec<usize> = (0..FRAMES).filter(|i| !dropped.contains(i)).collect();
+        for &i in &order {
+            socket.send_to(&wire[i], ("127.0.0.1", port)).unwrap();
+            sleep(Duration::from_millis(1));
+        }
+        sleep(Duration::from_millis(500));
+        ffmpeg.interrupt();
+
+        // ffmpeg's jitter buffer puts the swapped pair back in order.
+        let decoded = l16_samples(&fs::read(&output_path).unwrap());
+        let expected: Vec<i16> = (0..FRAMES)
+            .filter(|i| !dropped.contains(i))
+            .flat_map(|i| frames[i].iter().copied())
+            .collect();
+        assert_eq!(decoded.len(), expected.len(), "frame count");
+        assert!(
+            decoded == expected,
+            "decrypted audio differs from what was sent"
+        );
+    }
+}

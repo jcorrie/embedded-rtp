@@ -2,11 +2,12 @@
 
 Real-time audio over RTP for microcontrollers and servers, from one crate.
 It is `no_std`, needs no allocator, uses no floating point, has no
-dependencies and forbids `unsafe`. Besides parsing and writing packets, it
-includes the parts that make audio actually play: the RFC 3550 statistics
-(sequence validation, loss, interarrival jitter), an adaptive reordering
-jitter buffer, click-free loss concealment for L16 audio, and RTCP reports
-with round-trip times.
+dependencies by default and forbids `unsafe`. Besides parsing and writing
+packets, it includes the parts that make audio actually play: the RFC 3550
+statistics (sequence validation, loss, interarrival jitter), an adaptive
+reordering jitter buffer, click-free loss concealment for L16 audio, RTCP
+reports with round-trip times, and optional SRTP to authenticate and encrypt
+it all.
 
 Other Rust RTP crates either need `std`, need an allocator, or leave the
 jitter buffer to you (see [why a new crate](docs/design.md#why-a-new-crate)).
@@ -22,6 +23,7 @@ intercom: Pico W devices talking to a server over UDP.
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [RTCP](#rtcp)
+- [SRTP](#srtp)
 - [Example: std::net::UdpSocket](#example-stdnetudpsocket)
 - [Sketch: embassy-net on a Pico W](#sketch-embassy-net-on-a-pico-w)
 - [Key concepts](#key-concepts)
@@ -36,7 +38,8 @@ intercom: Pico W devices talking to a server over UDP.
 ## Features
 
 - **`no_std`, no `alloc`, no floats, no `unsafe`, no dependencies.** MSRV is
-  Rust 1.81.
+  Rust 1.81. The optional `srtp` feature adds audited RustCrypto crates,
+  which are `no_std` and allocation-free too.
 - **Sans-IO.** You pass in datagrams and the current time; the crate never
   touches sockets or clocks. It works the same under embassy, RTIC, tokio or
   a plain loop, and is deterministic under test.
@@ -54,6 +57,7 @@ intercom: Pico W devices talking to a server over UDP.
 | [`Receiver`](src/receiver.rs) / [`Sender`](src/sender.rs) | The above wired together for one incoming and one outgoing stream. This is what most code uses. |
 | [`rtcp`](src/rtcp.rs) | RTCP (RFC 3550 §6): read and write compound packets with SR, RR, SDES and BYE, validated per appendix A.2. Round-trip times from report blocks. |
 | [`l16`](src/l16.rs) | Big-endian PCM16 encode/decode (RFC 3551 §4.5.11) and `Concealer`, which turns playout into samples and fades over lost frames without clicks. |
+| [`srtp`](src/srtp.rs) | SRTP and SRTCP (RFC 3711), `AES_CM_128_HMAC_SHA1_80`, in place on the packet buffer, with replay protection and seamless rekeying. AES key wrap (RFC 5649) to deliver session keys without TLS. Behind the `srtp` feature. |
 | [`profile`](src/profile.rs) | Constants for an intercom format: L16, 16 kHz mono, 20 ms frames, payload type 96. Nothing else depends on them. |
 
 ## Status
@@ -65,7 +69,8 @@ Done:
 - packets, RFC 3550 statistics and RTP/RTCP demultiplexing (milestone 1, #1);
 - jitter buffer, `Receiver` and `Sender` (milestone 2, #2);
 - L16 helpers and click-free loss concealment (#7);
-- RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3).
+- RTCP: sender and receiver reports, SDES, BYE and round-trip times (#3);
+- SRTP and SRTCP, interoperating with ffmpeg (#8).
 
 Next: a server integration guide and mixing-server example
 ([#4](https://github.com/jcorrie/embedded-rtp/issues/4)) and a Pico W example
@@ -73,9 +78,10 @@ Next: a server integration guide and mixing-server example
 
 Not supported (yet):
 
-- **No SRTP or SRTCP.** Packets are neither authenticated nor encrypted
-  ([#8](https://github.com/jcorrie/embedded-rtp/issues/8)). Use it on a
-  trusted network or under another layer of protection for now.
+- **No key exchange.** SRTP takes keys from you; how they reach both ends is
+  up to the application (see [SRTP](#srtp)). End-to-end key agreement for
+  direct calls is planned
+  ([#15](https://github.com/jcorrie/embedded-rtp/issues/15)).
 - **L16 only** for decoding and concealment. The payload is opaque to
   `Receiver` and `Sender`, so you can carry other formats, but G.722 support
   is still to come ([#12](https://github.com/jcorrie/embedded-rtp/issues/12)).
@@ -96,6 +102,12 @@ The crate is not published to crates.io. Depend on it from git:
 ```toml
 [dependencies]
 embedded-rtp = { git = "https://github.com/jcorrie/embedded-rtp" }
+```
+
+For SRTP, turn on the `srtp` feature:
+
+```toml
+embedded-rtp = { git = "https://github.com/jcorrie/embedded-rtp", features = ["srtp"] }
 ```
 
 Pin a revision (`rev = "..."`) if you need reproducible builds while the API
@@ -294,6 +306,82 @@ for packet in Compound::parse(&rr).unwrap().packets() {
     }
 }
 ```
+
+## SRTP
+
+With the `srtp` feature, `srtp::Outbound` protects what you send and
+`srtp::Inbound` checks and decrypts what you receive, both in place on the
+packet buffer. The suite is `AES_CM_128_HMAC_SHA1_80` (RFC 3711's default,
+and what ffmpeg and SDES use): AES-128 in counter mode plus an 80-bit
+HMAC-SHA1 tag on every packet. RTP grows by 10 bytes and RTCP by 14, so size
+buffers with `srtp::RTP_OVERHEAD` and `srtp::RTCP_OVERHEAD`.
+
+A packet reaches the jitter buffer only once its tag checks out. Replays and
+packets more than 64 behind the newest are rejected (RFC 3711 §3.3.2), and a
+rejected packet changes no state, so forged traffic can't disturb a stream.
+Each context belongs to one stream: one SSRC, with its RTP and its RTCP.
+
+```rust
+# #[cfg(feature = "srtp")] {
+use embedded_rtp::jitter::Config;
+use embedded_rtp::packet::Packet;
+use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::srtp::{self, Inbound, MasterKey, Outbound};
+use embedded_rtp::{Receiver, Sender};
+
+// A fresh key for this session, from a random number generator.
+let key = MasterKey::from_bytes(&[0x2a; 30]);
+
+let mut sender = Sender::new(0x5eed_1234, PAYLOAD_TYPE, FRAME_SAMPLES as u32, 0, 0);
+let mut outbound = Outbound::new(&key);
+let mut inbound = Inbound::new(&key);
+let mut receiver = Receiver::<8, FRAME_BYTES>::new(PAYLOAD_TYPE, FRAME_SAMPLES as u32, Config::DEFAULT);
+
+// Sending: write the packet, then protect it in place.
+let mut wire = [0u8; PACKET_BYTES + srtp::RTP_OVERHEAD];
+let len = sender.send(&[0; FRAME_BYTES], &mut wire).unwrap();
+let len = outbound.protect_rtp(&mut wire, len).unwrap();
+
+// Receiving: unprotect in place, then parse what's left.
+let datagram = &mut wire[..len];
+match inbound.unprotect_rtp(datagram) {
+    Ok(len) => {
+        receiver.receive(&Packet::parse(&datagram[..len]).unwrap(), 0);
+    }
+    Err(_) => { /* forged, replayed or under another key: drop it */ }
+}
+# }
+```
+
+### Keys
+
+A `MasterKey` is the 16-byte key and 14-byte salt that SDP's
+`a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:...` line carries in base64. The
+crate doesn't care where it came from, but **use a fresh master key for every
+session**. Counter mode derives each packet's keystream from the key, the
+SSRC and the packet index. A device that keeps one key in flash and restarts
+its sequence numbers after a reboot reuses keystream, which leaks the XOR of
+two stretches of audio.
+
+What works well for a fleet of devices and a server:
+
+1. **A long-term secret per device**, used only to prove to the server who
+   the device is. It never encrypts audio.
+2. **Session keys from the server** when the device connects, or when a call
+   starts for direct device-to-device calls. Either send them over an
+   authenticated TLS connection, or, for devices without TLS, wrap them
+   under a key derived from the device secret with `srtp::wrap` and
+   `srtp::unwrap` (AES key wrap, RFC 5649).
+
+A server that issues keys can decrypt the calls it keys, which a mixing
+server needs to anyway. End-to-end keys that the server never sees are
+[#15](https://github.com/jcorrie/embedded-rtp/issues/15).
+
+`rekey` on both contexts switches to a new key mid-stream: the receiver keeps
+accepting the old key until the first packet under the new one, so audio
+isn't interrupted. Both ends must start a context together, because the
+rollover counter starts at zero; that's the normal case with fresh keys per
+session.
 
 ## Example: std::net::UdpSocket
 
@@ -559,6 +647,16 @@ a=rtpmap:96 L16/16000/1
 a=ptime:20
 ```
 
+With SRTP, the profile becomes `RTP/SAVP` and a crypto line carries the key
+(base64 of the 30 bytes from `MasterKey::to_bytes`):
+
+```text
+m=audio 5004 RTP/SAVP 96
+a=rtpmap:96 L16/16000/1
+a=ptime:20
+a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:<base64 key and salt>
+```
+
 For example, to listen to a stream sent to port 5004, save a complete SDP
 file (adding `v=0`, `o=`, `s=`, `c=IN IP4 127.0.0.1` and `t=0 0` lines) as
 `stream.sdp` and run:
@@ -579,11 +677,14 @@ slightly smaller.
 | `Concealer<320>` | 1,292 (two frames of samples) |
 | `SourceStats` | 40 |
 | `Sender` | 24 |
-| Packet buffer | 652 |
+| Packet buffer | 652 (662 with SRTP) |
+| `srtp::Outbound` | 1,760 (1,040 on the RP2040) |
+| `srtp::Inbound` | 3,536 (2,080 on the RP2040; half holds the old key during a rekey) |
 
 A full-duplex Pico client (8-slot receiver, sender, one packet buffer) needs
 about 6 KB of the RP2040's 264 KB, plus about 1.3 KB for a concealer. A jitter
-buffer takes roughly `SLOTS × (FRAME + 4)` bytes.
+buffer takes roughly `SLOTS × (FRAME + 4)` bytes. SRTP adds about 3 KB
+for one stream each way.
 
 ## Performance
 
@@ -599,6 +700,9 @@ the optimizations behind them and the latency budget.
 | `Concealer::play`, no loss | ~30 ns (23 ns with AVX2) |
 | A lost frame, then audio again | ~330 ns (124 ns with AVX2) |
 | RTCP: write SR + report block + SDES / parse it | ~21 ns / ~42 ns |
+| SRTP: protect a frame / protect and unprotect | ~0.67 µs / ~1.3 µs |
+| SRTP: reject a forged frame | ~0.55 µs |
+| One frame, one direction, with SRTP | ~1.3 µs |
 
 The hot path makes one payload copy (into the jitter buffer) and no division,
 which matters on the Cortex-M0+: it has no divide instruction. Processing is
@@ -609,11 +713,18 @@ to start) and the network.
 On a server, build with `-C target-cpu=x86-64-v3` (AVX2) so concealment
 vectorizes.
 
+SRTP dominates once it's on, almost all of it HMAC-SHA1 over each packet,
+even with the CPU's SHA instructions. On a server that's still about 0.013%
+of a core per stream. On the RP2040 it's the biggest per-frame cost and will
+be measured on hardware in
+[#5](https://github.com/jcorrie/embedded-rtp/issues/5).
+
 ```sh
 # Criterion benchmarks
 cargo bench --bench hot_path
 cargo bench --bench hot_path -- --save-baseline before   # then, after a change:
 cargo bench --bench hot_path -- --baseline before
+cargo bench --features srtp --bench srtp
 
 # Deterministic per-line instruction counts with Callgrind
 cargo build --release --example profile
@@ -651,14 +762,20 @@ pass:
   counts exactly the stream it sent. GStreamer accepts our sender reports:
   it echoes them in its receiver reports, giving a loopback round trip
   under 100 ms.
+- **SRTP.** Packets protected byte for byte as libsrtp's own known-answer
+  test does it, for RTP and SRTCP; the RFC 3711 appendix B keystream and key
+  derivation vectors; key wrap against OpenSSL. ffmpeg decrypts our stream to
+  the exact audio, and we decrypt ffmpeg's RTP and SRTCP, both across the
+  sequence number wrap. Every single-bit change to a packet is rejected, as
+  are wrong keys, replays and packets outside the window.
 - **Concealment.** On a sine wave with random losses and dry spells at every
   phase, no sample step exceeds the designed bound.
 - **Planted bugs.** Bugs planted by hand (wrong byte order, off-by-one
   limits, wrong jitter gain and so on) were caught by the suite.
 
 ```sh
-cargo test                                               # everything except interop
-cargo test --test interop -- --ignored --test-threads=1  # needs ffmpeg and GStreamer
+cargo test --all-features                                               # everything except interop
+cargo test --all-features --test interop -- --ignored --test-threads=1  # needs ffmpeg and GStreamer
 cargo build --release --target thumbv6m-none-eabi        # the embedded build
 ```
 
@@ -675,13 +792,13 @@ From the [milestones](docs/design.md#milestones) in the design document:
 |---|---|---|
 | [#4](https://github.com/jcorrie/embedded-rtp/issues/4) | Server integration guide and mixing-server example | Next |
 | [#5](https://github.com/jcorrie/embedded-rtp/issues/5) | Pico W example (embassy-net) with on-device measurements | Next |
-| [#8](https://github.com/jcorrie/embedded-rtp/issues/8) | SRTP: authenticate (and encrypt) | High |
 | [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
 | [#11](https://github.com/jcorrie/embedded-rtp/issues/11) | Redundant audio (RFC 2198) | Medium |
 | [#12](https://github.com/jcorrie/embedded-rtp/issues/12) | G.722 codec | Low until bandwidth matters |
 | [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
 | [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |
+| [#15](https://github.com/jcorrie/embedded-rtp/issues/15) | End-to-end key agreement for direct calls | Low until needed |
 | [#6](https://github.com/jcorrie/embedded-rtp/issues/6) | Fuzzing | Low |
 
 [docs/design.md](docs/design.md) explains the design: why existing crates
@@ -695,14 +812,15 @@ pass:
 
 ```sh
 cargo fmt --check
-RUSTFLAGS="-D warnings" cargo clippy --all-targets
-cargo test                                          # on stable and on 1.81 (MSRV)
-cargo build --release --target thumbv6m-none-eabi   # no std, no allocator
-cargo test --test interop -- --ignored --test-threads=1
+RUSTFLAGS="-D warnings" cargo clippy --all-targets               # and with --all-features
+cargo test                                                       # and with --all-features, on stable and 1.81 (MSRV)
+cargo build --release --target thumbv6m-none-eabi --all-features  # no std, no allocator
+cargo test --all-features --test interop -- --ignored --test-threads=1
 ```
 
-Keep the library free of dependencies, allocation, floating point and
-`unsafe`, and keep constructors `const`. New behaviour should be tested
+Keep the library free of dependencies (optional, audited ones aside),
+allocation, floating point and `unsafe`, and keep constructors `const` (SRTP
+contexts are the exception: they derive keys). New behaviour should be tested
 against an independent reference (an RFC, a simulation that knows the right
 answer, or another implementation) rather than by round-tripping through the
 crate's own code.

@@ -1,9 +1,10 @@
 //! RTP for microcontrollers, usable unchanged on a server.
 //!
 //! `no_std`, no allocator, no floating point (the RP2040 has no FPU) and no
-//! dependencies. All state is fixed size and can live in a `static`. The crate
-//! never touches sockets or clocks: callers hand in datagrams and the current
-//! time, so it works the same under embassy, RTIC, tokio or a bare loop.
+//! dependencies unless the `srtp` feature is on. All state is fixed size and
+//! can live in a `static`. The crate never touches sockets or clocks: callers
+//! hand in datagrams and the current time, so it works the same under
+//! embassy, RTIC, tokio or a bare loop.
 //!
 //! - [`packet`]: RTP packets (RFC 3550 §5) and RTP/RTCP demultiplexing on one
 //!   port (RFC 5761).
@@ -16,6 +17,8 @@
 //!   goodbyes (RFC 3550 §6).
 //! - [`l16`]: the L16 payload format and packet loss concealment.
 //! - [`profile`]: an intercom media format: L16, 16 kHz mono, 20 ms frames.
+//! - `srtp` (with the `srtp` feature): SRTP and SRTCP (RFC 3711), to
+//!   authenticate and encrypt both.
 //!
 //! See `docs/design.md` for the design, measurements and roadmap.
 
@@ -30,6 +33,8 @@ pub mod profile;
 mod receiver;
 pub mod rtcp;
 mod sender;
+#[cfg(feature = "srtp")]
+pub mod srtp;
 pub mod stats;
 
 pub use receiver::{Received, Receiver};
