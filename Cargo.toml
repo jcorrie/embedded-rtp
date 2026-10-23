@@ -9,7 +9,7 @@ repository = "https://github.com/jcorrie/embedded-rtp"
 keywords = ["rtp", "rtcp", "jitter-buffer", "no_std", "embedded"]
 categories = ["embedded", "no-std", "network-programming", "multimedia::audio"]
 # Consumed as a git dependency, not from crates.io.
-publish = false
+publish = true
 
 # No dependencies by default: this has to build for a Pico W (thumbv6m, no
 # FPU, no CAS atomics, no allocator) as well as for a server. The optional
