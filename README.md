@@ -24,6 +24,7 @@ intercom: Pico W devices talking to a server over UDP.
 - [Quick start](#quick-start)
 - [RTCP](#rtcp)
 - [SRTP](#srtp)
+- [Building an intercom](#building-an-intercom)
 - [Example: std::net::UdpSocket](#example-stdnetudpsocket)
 - [Sketch: embassy-net on a Pico W](#sketch-embassy-net-on-a-pico-w)
 - [Key concepts](#key-concepts)
@@ -382,6 +383,54 @@ accepting the old key until the first packet under the new one, so audio
 isn't interrupted. Both ends must start a context together, because the
 rollover counter starts at zero; that's the normal case with fresh keys per
 session.
+
+## Building an intercom
+
+The crate was written for an intercom: devices and a server, each device
+hearing everyone but itself. The pieces fit together like this.
+
+**Format.** Use `profile`: L16, 16 kHz mono, 20 ms frames (640 bytes),
+payload type 96, RTP and RTCP on one UDP port.
+
+**Device, every 20 ms tick:**
+
+1. Capture 320 samples into the packet buffer after the 12-byte header,
+   then `Sender::send_in_place` and `Outbound::protect_rtp`. Send.
+   Nothing to say? Call `Sender::skip` and send nothing.
+2. Play `concealer.play(receiver.play())`. `None` means silence; keep the
+   output clock running either way.
+
+**Device, on each datagram:**
+
+- `packet::is_rtcp`: `Inbound::unprotect_rtcp`, then `Compound::parse`.
+- Otherwise: `Inbound::unprotect_rtp`, `Packet::parse`, then
+  `Receiver::receive`. Drop anything that fails.
+
+**Device, every few seconds:** an RR (or SR while talking) plus SDES
+CNAME and NAME, through `Outbound::protect_rtcp`. It doubles as the
+keep-alive. Send a BYE on shutdown.
+
+**Server, per participant:** a `Receiver`, `Concealer` and `Inbound` for
+what it sends; a `Sender` and `Outbound` for what it hears.
+
+**Server, every 20 ms tick:**
+
+1. Play every participant's concealer and sum all as `i32`.
+2. For each participant, subtract its own samples ("mix minus"),
+   clamp to `i16`, `l16::encode` into its packet and send. If the result
+   is silent, `skip` instead.
+
+**Keys.** The server makes fresh SRTP keys per participant when it
+connects, and delivers them over TLS or with `srtp::wrap`. Never one fixed
+key per device: see [SRTP](#srtp).
+
+**Sizing.** About 6 KB of RAM per device for RTP (8-slot receiver), plus
+about 3 KB for SRTP. 16 slots on the server.
+
+Runnable code: [std::net::UdpSocket](#example-stdnetudpsocket) and the
+[Pico W sketch](#sketch-embassy-net-on-a-pico-w). Full examples are
+planned in [#4](https://github.com/jcorrie/embedded-rtp/issues/4) (server)
+and [#5](https://github.com/jcorrie/embedded-rtp/issues/5) (Pico W).
 
 ## Example: std::net::UdpSocket
 
