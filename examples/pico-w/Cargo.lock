@@ -1045,6 +1045,7 @@ dependencies = [
  "embassy-time",
  "embedded-rtp",
  "panic-probe",
+ "pio",
  "portable-atomic",
  "static_cell",
 ]

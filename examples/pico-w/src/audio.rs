@@ -10,14 +10,14 @@
 //! | Word clock | GP11 / GP19 | WS | LRC |
 //! | Data | GP12 / GP20 | SD | DIN |
 //!
-//! The microphone's L/R pin goes to ground (left channel). Each bus runs at
-//! 16 kHz with 16-bit stereo slots; the amplifier gets the same sample in
-//! both channels.
+//! The microphone's L/R pin goes to ground (left channel). Both buses run
+//! at 16 kHz: the microphone with 32-bit slots (`mic.rs`), the amplifier
+//! with 16-bit stereo slots, getting the same sample in both channels.
 
 use embassy_futures::join::join;
 use embassy_rp::dma;
 use embassy_rp::pio::{Common, Instance, PioPin, StateMachine};
-use embassy_rp::pio_programs::i2s::{PioI2sIn, PioI2sInProgram, PioI2sOut, PioI2sOutProgram};
+use embassy_rp::pio_programs::i2s::{PioI2sOut, PioI2sOutProgram};
 use embassy_rp::{interrupt, Peri};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -26,6 +26,7 @@ use embedded_rtp::profile::{CLOCK_RATE, FRAME_SAMPLES};
 use static_cell::StaticCell;
 
 use crate::device::Frame;
+use crate::mic::{Mic, MicProgram};
 
 /// Frames captured from the microphone, for the network task. Two deep: if
 /// the network task falls behind, the newest frames win.
@@ -48,7 +49,7 @@ pub struct Pins<'d, A: PioPin, B: PioPin, C: PioPin, D: PioPin, E: PioPin, F: Pi
 }
 
 pub struct I2s<P: Instance + 'static> {
-    mic: PioI2sIn<'static, P, 0>,
+    mic: Mic<'static, P, 0>,
     amp: PioI2sOut<'static, P, 1>,
 }
 
@@ -73,21 +74,17 @@ impl<P: Instance> I2s<P> {
             impl PioPin,
         >,
     ) -> Self {
-        let in_program = PioI2sInProgram::new(common);
+        let mic_program = MicProgram::new(common);
         let out_program = PioI2sOutProgram::new(common);
-        let mic = PioI2sIn::new(
+        let mic = Mic::new(
             common,
             sm0,
             dma_in,
             irqs,
-            true, // pull the data line down when the microphone isn't driving it
             pins.mic_data,
             pins.mic_bit_clock,
             pins.mic_word_clock,
-            CLOCK_RATE,
-            16,
-            2,
-            &in_program,
+            &mic_program,
         );
         let amp = PioI2sOut::new(
             common,
@@ -123,6 +120,7 @@ pub async fn run(mut i2s: I2s<embassy_rp::peripherals::PIO1>) -> ! {
 
         let mut captured = [0i16; FRAME_SAMPLES];
         for (sample, word) in captured.iter_mut().zip(mic_back.iter()) {
+            // The top 16 bits of the 24-bit sample.
             let left = (*word >> 16) as i16;
             *sample = left.saturating_mul(1 << MIC_GAIN_SHIFT);
         }

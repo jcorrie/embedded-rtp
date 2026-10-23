@@ -41,6 +41,7 @@ defmt-rtt = "1"
 panic-probe = { version = "1", features = ["print-defmt"] }
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
+pio = "0.3"
 
 [profile.release]
 debug = 2

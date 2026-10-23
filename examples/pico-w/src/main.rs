@@ -12,6 +12,7 @@
 mod audio;
 #[path = "../../common/device.rs"]
 mod device;
+mod mic;
 
 use core::net::SocketAddrV4;
 

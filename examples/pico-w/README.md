@@ -30,9 +30,11 @@ tested on the host. Reports welcome.
 | 3.3 V | 3V3 | VDD | VIN |
 | Ground | GND | GND, L/R | GND |
 
-Both buses run at 16 kHz with 16-bit stereo slots. The microphone's L/R
-pin goes to ground, so it sends on the left channel. The amplifier gets the
-same sample in both channels.
+Both buses run at 16 kHz. The microphone gets 32-bit slots (64 bit clocks
+a frame, sampled on the rising edge), as INMP441-class microphones need;
+`src/mic.rs` has the PIO program. Its L/R pin goes to ground, so it sends
+on the left channel. The amplifier gets 16-bit stereo slots, with the same
+sample in both channels.
 
 ## Configure and flash
 
@@ -97,7 +99,8 @@ of it Wi-Fi firmware); static RAM is about 52 KB.
 ## Files
 
 - `src/main.rs`: configuration, Wi-Fi, the network task
-- `src/audio.rs`: I2S microphone and amplifier
+- `src/audio.rs`: the audio task, microphone and amplifier
+- `src/mic.rs`: the I2S microphone's PIO program
 - `src/cycles.rs`: the on-device cost measurement
 - `firmware/`: the CYW43439's NVRAM settings (see its README for the
   licence)
