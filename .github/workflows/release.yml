@@ -1,0 +1,59 @@
+# Publish to crates.io and make a GitHub release when a version tag is
+# pushed: bump `version` in Cargo.toml, merge, then
+#     git tag v0.2.0 && git push origin v0.2.0
+# The whole of CI runs first. crates.io trusts this workflow directly
+# (Trusted Publishing), so no API token is stored: the crate's settings
+# name this repository, this file and the `release` environment.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: ci
+    runs-on: ubuntu-latest
+    # Can require an approval: repository settings, Environments.
+    environment: release
+    permissions:
+      contents: write # the GitHub release
+      id-token: write # Trusted Publishing
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the tag
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 |
+            jq -r '.packages[] | select(.name == "embedded-rtp") | .version')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME, but Cargo.toml says $version"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_REF_NAME is not on main"
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      # Notes from the pull requests merged since the last tag. A version
+      # with a pre-release part (v0.2.0-rc.1) is marked as a pre-release.
+      - name: GitHub release
+        run: |
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes \
+            --title "$GITHUB_REF_NAME" $prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}

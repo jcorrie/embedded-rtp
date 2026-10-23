@@ -34,6 +34,7 @@ intercom: Pico W devices talking to a server over UDP.
 - [Testing and conformance](#testing-and-conformance)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
+- [Releasing](#releasing)
 - [Licence](#licence)
 
 ## Features
@@ -98,21 +99,18 @@ Not supported (yet):
 
 ## Installation
 
-The crate is not published to crates.io. Depend on it from git:
-
 ```toml
 [dependencies]
-embedded-rtp = { git = "https://github.com/jcorrie/embedded-rtp" }
+embedded-rtp = "0.1"
 ```
 
 For SRTP, turn on the `srtp` feature:
 
 ```toml
-embedded-rtp = { git = "https://github.com/jcorrie/embedded-rtp", features = ["srtp"] }
+embedded-rtp = { version = "0.1", features = ["srtp"] }
 ```
 
-Pin a revision (`rev = "..."`) if you need reproducible builds while the API
-is still moving.
+While the version is 0.x, a minor version (0.1 to 0.2) may break the API.
 
 ## Quick start
 
@@ -835,6 +833,31 @@ contexts are the exception: they derive keys). New behaviour should be tested
 against an independent reference (an RFC, a simulation that knows the right
 answer, or another implementation) rather than by round-tripping through the
 crate's own code.
+
+## Releasing
+
+Pushing a version tag publishes it. `.github/workflows/release.yml` runs the
+whole of CI, checks that the tag matches `Cargo.toml` and is on `main`,
+publishes to crates.io, and makes a GitHub release with notes from the
+merged pull requests.
+
+1. In a pull request, bump `version` in `Cargo.toml` (0.x: a minor bump for
+   breaking changes, a patch bump otherwise), then merge it.
+2. Tag the merge on `main` and push the tag:
+
+   ```sh
+   git switch main && git pull
+   git tag v0.2.0 && git push origin v0.2.0
+   ```
+
+A tag with a pre-release part (`v0.2.0-rc.1`) makes a pre-release. If the
+publish works but the GitHub release step fails, rerunning the job fails
+too, because the version is already on crates.io; make the release by hand
+with `gh release create v0.2.0 --verify-tag --generate-notes`.
+
+crates.io publishes through Trusted Publishing, so no token is stored. Its
+settings for the crate name this repository, the workflow `release.yml` and
+the environment `release`.
 
 ## Licence
 
