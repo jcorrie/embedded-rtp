@@ -58,6 +58,13 @@ The log (over the probe) shows the Wi-Fi join, the address it got and
   `--insecure`.
 - `--features listen-only` builds a speaker-only device: no microphone, and
   BOOTSEL is ignored.
+- `--features always-on` sends the microphone all the time: full duplex,
+  with no button. Without echo handling (#9), keep the speaker away from
+  the microphone, or the room hears itself back.
+- `--features cpu-load` logs the CPU's load every 5 s, everything included
+  (audio, Wi-Fi, SRTP). It counts idle-loop iterations against a baseline
+  taken at boot, before the audio and Wi-Fi start, and keeps the CPU from
+  sleeping, so use it only to measure.
 
 ## How it runs
 
@@ -70,13 +77,19 @@ The log (over the probe) shows the Wi-Fi join, the address it got and
   when BOOTSEL isn't held) and hands the next frame to play back.
 - **Wi-Fi** power saving is off; it would add tens of milliseconds to every
   packet.
-- **Half duplex by button** is the echo baseline from issue #9. Holding
-  BOOTSEL briefly stalls flash reads; the audio buffers cover it.
+- **Half duplex by button** is the echo baseline from issue #9: while
+  BOOTSEL is held the speaker plays silence, so the microphone can't send
+  the room back to everyone. Holding BOOTSEL briefly stalls flash reads; the
+  audio buffers cover it.
 
 ## Cost per frame
 
 The same workload runs on a Pico (`cargo run --release --bin cycles`, real
 cycles) and under QEMU in CI (`examples/m0-cycles`, ARMv6-M instructions).
+By default the firmware uses the RP2040 ROM's division and memory-copy
+routines (the `rom-intrinsics` feature); run
+`cargo run --release --bin cycles --no-default-features` too, to see what
+they save.
 QEMU's counts for a whole device frame, both directions with SRTP:
 
 | Operation | Instructions |

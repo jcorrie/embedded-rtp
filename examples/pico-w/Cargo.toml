@@ -19,15 +19,26 @@ test = false
 bench = false
 
 [features]
+default = ["rom-intrinsics"]
+# The RP2040 ROM's routines for division and memory copies. Build `cycles`
+# with `--no-default-features` to measure what they save.
+rom-intrinsics = ["embassy-rp/intrinsics", "embassy-rp/rom-func-cache"]
 # No microphone: only listen.
 listen-only = []
+# Send the microphone all the time instead of while BOOTSEL is held: full
+# duplex. Without echo handling (#9), anyone near the speaker is sent back
+# to the room.
+always-on = []
+# Log the CPU's load every 5 s, everything included, by counting idle-loop
+# iterations. Keeps the CPU from sleeping, so only for measuring.
+cpu-load = []
 
 [dependencies]
 embedded-rtp = { path = "../..", features = ["srtp"] }
 
 embassy-executor = { version = "0.10", features = ["platform-cortex-m", "executor-thread", "executor-interrupt", "defmt"] }
 embassy-time = { version = "0.5", features = ["defmt", "defmt-timestamp-uptime"] }
-embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040", "intrinsics", "rom-func-cache"] }
+embassy-rp = { version = "0.10", features = ["defmt", "unstable-pac", "time-driver", "critical-section-impl", "rp2040"] }
 embassy-net = { version = "0.9", features = ["defmt", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
 embassy-sync = { version = "0.8", features = ["defmt"] }
 embassy-futures = "0.1"
