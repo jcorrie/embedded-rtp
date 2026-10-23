@@ -95,8 +95,9 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --release --bins
-      - run: cargo build --release --features listen-only
       - run: cargo clippy --release --bins --features always-on,cpu-load
+      - run: cargo clippy --release --bins --no-default-features --features listen-only
+      - run: cargo build --release --features listen-only
       # Unconfigured, the compiler can tell the device never starts and
       # drops most of the program; a configured build compiles all of it.
       - run: cargo build --release

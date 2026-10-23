@@ -12,8 +12,6 @@
 mod audio;
 #[path = "../../common/device.rs"]
 mod device;
-#[cfg(feature = "cpu-load")]
-mod load;
 mod mic;
 
 use core::net::SocketAddrV4;
@@ -69,9 +67,6 @@ const fn config(value: Option<&'static str>) -> &'static str {
 /// takes a while on a Cortex-M0+) can't make it miss a DMA deadline.
 static AUDIO_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
 
-#[cfg(all(feature = "listen-only", feature = "always-on"))]
-compile_error!("`listen-only` has no microphone to keep on");
-
 #[interrupt]
 unsafe fn SWI_IRQ_1() {
     unsafe { AUDIO_EXECUTOR.on_interrupt() }
@@ -104,11 +99,7 @@ fn main() -> ! {
             amp_word_clock: p.PIN_19,
         },
     );
-    interrupt::SWI_IRQ_1.set_priority(Priority::P2);
-    let audio_spawner = AUDIO_EXECUTOR.start(interrupt::SWI_IRQ_1);
-    audio_spawner.spawn(unwrap!(audio::run(i2s)));
-
-    // Everything else in thread mode.
+    // Everything else in thread mode; `start` starts the audio.
     static EXECUTOR: StaticCell<Executor> = StaticCell::new();
     let executor = EXECUTOR.init(Executor::new());
     executor.run(|spawner| {
@@ -123,6 +114,7 @@ fn main() -> ! {
                 dma: p.DMA_CH0,
             },
             p.BOOTSEL,
+            i2s,
         )));
     });
 }
@@ -150,7 +142,24 @@ struct WifiBoard {
 }
 
 #[embassy_executor::task]
-async fn start(spawner: Spawner, wifi: WifiBoard, bootsel: Peri<'static, peripherals::BOOTSEL>) {
+async fn start(
+    spawner: Spawner,
+    wifi: WifiBoard,
+    bootsel: Peri<'static, peripherals::BOOTSEL>,
+    i2s: audio::I2s<PIO1>,
+) {
+    // The CPU-load baseline is taken with nothing else running, so it comes
+    // before the audio and the Wi-Fi.
+    #[cfg(feature = "cpu-load")]
+    let baseline = {
+        spawner.spawn(unwrap!(load::idle()));
+        load::baseline().await
+    };
+
+    interrupt::SWI_IRQ_1.set_priority(Priority::P2);
+    let audio_spawner = AUDIO_EXECUTOR.start(interrupt::SWI_IRQ_1);
+    audio_spawner.spawn(unwrap!(audio::run(i2s)));
+
     let server: SocketAddrV4 = match SERVER.parse() {
         Ok(server) => server,
         Err(_) => defmt::panic!("set SERVER=<ip>:<port> when building, e.g. 192.168.1.10:5004"),
@@ -166,14 +175,6 @@ async fn start(spawner: Spawner, wifi: WifiBoard, bootsel: Peri<'static, periphe
             device::parse_kek(DEVICE_KEK)
                 .unwrap_or_else(|| defmt::panic!("DEVICE_KEK: 32 hex digits")),
         )
-    };
-
-    // Measure the idle rate before Wi-Fi starts, with only the audio
-    // running.
-    #[cfg(feature = "cpu-load")]
-    let baseline = {
-        spawner.spawn(unwrap!(load::idle()));
-        load::baseline().await
     };
 
     // Wi-Fi.
@@ -245,12 +246,10 @@ async fn start(spawner: Spawner, wifi: WifiBoard, bootsel: Peri<'static, periphe
     static DEVICE: StaticCell<Device<'static>> = StaticCell::new();
     let device = DEVICE.init(Device::new(DEVICE_ID, DEVICE_NAME, kek, seed));
     let server_endpoint = IpEndpoint::from(server);
-    info!("talking to {} as {}", SERVER, DEVICE_ID);
-    if cfg!(feature = "always-on") {
-        info!("microphone always on");
-    } else if !cfg!(feature = "listen-only") {
-        info!("hold BOOTSEL to talk");
-    }
+    info!(
+        "talking to {} as {}; hold BOOTSEL to talk",
+        SERVER, DEVICE_ID
+    );
     #[cfg(feature = "cpu-load")]
     spawner.spawn(unwrap!(load::report(baseline)));
 
@@ -297,15 +296,17 @@ async fn run(
                 let talking = !cfg!(feature = "listen-only")
                     && (cfg!(feature = "always-on")
                         || embassy_rp::bootsel::is_bootsel_pressed(bootsel.reborrow()));
-                // Push-to-talk is half duplex: the speaker stays quiet while
-                // the button is held, so the microphone doesn't send the room
-                // back to itself.
-                let muted = talking && !cfg!(feature = "always-on");
                 let capture: Option<&Frame> = if talking { Some(&captured) } else { None };
                 outbox.used = 0;
+                // Tick even when muted, so the jitter buffer keeps time.
                 let heard = device.tick(now, capture, &mut |d| outbox.push(d));
-                let heard = heard.filter(|_| !muted);
-                audio::PLAYBACK.signal(heard.unwrap_or([0; FRAME_SAMPLES]));
+                // Half duplex: while BOOTSEL is held the speaker is quiet, so
+                // the microphone doesn't send the room back to everyone.
+                let muted = talking && !cfg!(feature = "always-on");
+                audio::PLAYBACK.signal(match heard {
+                    Some(frame) if !muted => frame,
+                    _ => [0; FRAME_SAMPLES],
+                });
                 for (datagram, len) in &outbox.slots[..outbox.used] {
                     if socket.send_to(&datagram[..*len], server).await.is_err() {
                         warn!("send failed");
@@ -327,6 +328,54 @@ async fn run(
                 device.datagram(&mut buf[..len], Instant::now().as_millis());
             }
             Either::Second(_) => {}
+        }
+    }
+}
+
+/// CPU load, everything included: an idle task on the thread-mode executor
+/// counts its iterations, and any time the CPU spends elsewhere (audio,
+/// Wi-Fi, the network stack, SRTP) is time it doesn't count. Load is the
+/// shortfall against a baseline counted with nothing else running.
+#[cfg(feature = "cpu-load")]
+mod load {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use defmt::info;
+    use embassy_time::{Duration, Ticker, Timer};
+
+    static IDLE: AtomicU32 = AtomicU32::new(0);
+
+    #[embassy_executor::task]
+    pub async fn idle() -> ! {
+        let mut count = 0u32;
+        loop {
+            count = count.wrapping_add(1);
+            IDLE.store(count, Ordering::Relaxed);
+            embassy_futures::yield_now().await;
+        }
+    }
+
+    /// Idle iterations in one second, with only the idle task running.
+    pub async fn baseline() -> u32 {
+        let start = IDLE.load(Ordering::Relaxed);
+        Timer::after_secs(1).await;
+        let baseline = IDLE.load(Ordering::Relaxed).wrapping_sub(start);
+        info!("cpu: {} idle iterations a second at rest", baseline);
+        baseline
+    }
+
+    #[embassy_executor::task]
+    pub async fn report(baseline: u32) -> ! {
+        const SECONDS: u32 = 5;
+        let mut ticker = Ticker::every(Duration::from_secs(u64::from(SECONDS)));
+        let mut last = IDLE.load(Ordering::Relaxed);
+        loop {
+            ticker.next().await;
+            let count = IDLE.load(Ordering::Relaxed);
+            let per_second = count.wrapping_sub(last) / SECONDS;
+            last = count;
+            let idle = (u64::from(per_second) * 1000 / u64::from(baseline.max(1))).min(1000);
+            info!("cpu: {}.{}% busy", (1000 - idle) / 10, (1000 - idle) % 10);
         }
     }
 }

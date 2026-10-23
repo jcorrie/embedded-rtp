@@ -58,13 +58,13 @@ The log (over the probe) shows the Wi-Fi join, the address it got and
   `--insecure`.
 - `--features listen-only` builds a speaker-only device: no microphone, and
   BOOTSEL is ignored.
-- `--features always-on` sends the microphone all the time and keeps the
-  speaker on: full duplex. With no echo handling yet (#9), keep the speaker
-  away from the microphone or the room hears itself.
-- `--features cpu-load` logs how busy the CPU is every 5 s, Wi-Fi and
-  network stack included. It counts how often an idle task gets to run,
-  against a count taken before Wi-Fi starts, so the core never sleeps; use
-  it for measuring, not in a real device.
+- `--features always-on` sends the microphone all the time: full duplex,
+  with no button. Without echo handling (#9), keep the speaker away from
+  the microphone, or the room hears itself back.
+- `--features cpu-load` logs the CPU's load every 5 s, everything included
+  (audio, Wi-Fi, SRTP). It counts idle-loop iterations against a baseline
+  taken at boot, before the audio and Wi-Fi start, and keeps the CPU from
+  sleeping, so use it only to measure.
 
 ## How it runs
 
@@ -78,13 +78,18 @@ The log (over the probe) shows the Wi-Fi join, the address it got and
 - **Wi-Fi** power saving is off; it would add tens of milliseconds to every
   packet.
 - **Half duplex by button** is the echo baseline from issue #9: while
-  BOOTSEL is held, the device sends and the speaker is silent. Holding
-  BOOTSEL briefly stalls flash reads; the audio buffers cover it.
+  BOOTSEL is held the speaker plays silence, so the microphone can't send
+  the room back to everyone. Holding BOOTSEL briefly stalls flash reads; the
+  audio buffers cover it.
 
 ## Cost per frame
 
 The same workload runs on a Pico (`cargo run --release --bin cycles`, real
 cycles) and under QEMU in CI (`examples/m0-cycles`, ARMv6-M instructions).
+By default the firmware uses the RP2040 ROM's division and memory-copy
+routines (the `rom-intrinsics` feature); run
+`cargo run --release --bin cycles --no-default-features` too, to see what
+they save.
 QEMU's counts for a whole device frame, both directions with SRTP:
 
 | Operation | Instructions |
@@ -110,6 +115,5 @@ of it Wi-Fi firmware); static RAM is about 52 KB.
 - `src/audio.rs`: the audio task, microphone and amplifier
 - `src/mic.rs`: the I2S microphone's PIO program
 - `src/cycles.rs`: the on-device cost measurement
-- `src/load.rs`: CPU load with Wi-Fi running (`cpu-load`)
 - `firmware/`: the CYW43439's NVRAM settings (see its README for the
   licence)
