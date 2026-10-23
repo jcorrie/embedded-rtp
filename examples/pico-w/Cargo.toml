@@ -21,6 +21,13 @@ bench = false
 [features]
 # No microphone: only listen.
 listen-only = []
+# Send the microphone all the time (full duplex) instead of push-to-talk,
+# and keep the speaker on while talking. Without echo handling (#9), a
+# speaker near the microphone feeds back.
+always-on = []
+# Log CPU load every 5 s, by counting idle-task iterations. Keeps the core
+# from sleeping, so only for measuring.
+cpu-load = []
 
 [dependencies]
 embedded-rtp = { path = "../..", features = ["srtp"] }

@@ -12,6 +12,8 @@
 mod audio;
 #[path = "../../common/device.rs"]
 mod device;
+#[cfg(feature = "cpu-load")]
+mod load;
 mod mic;
 
 use core::net::SocketAddrV4;
@@ -66,6 +68,9 @@ const fn config(value: Option<&'static str>) -> &'static str {
 /// Audio runs on a higher-priority executor, so a busy network task (SRTP
 /// takes a while on a Cortex-M0+) can't make it miss a DMA deadline.
 static AUDIO_EXECUTOR: InterruptExecutor = InterruptExecutor::new();
+
+#[cfg(all(feature = "listen-only", feature = "always-on"))]
+compile_error!("`listen-only` has no microphone to keep on");
 
 #[interrupt]
 unsafe fn SWI_IRQ_1() {
@@ -163,6 +168,14 @@ async fn start(spawner: Spawner, wifi: WifiBoard, bootsel: Peri<'static, periphe
         )
     };
 
+    // Measure the idle rate before Wi-Fi starts, with only the audio
+    // running.
+    #[cfg(feature = "cpu-load")]
+    let baseline = {
+        spawner.spawn(unwrap!(load::idle()));
+        load::baseline().await
+    };
+
     // Wi-Fi.
     static FIRMWARE: &cyw43::Aligned<cyw43::A4, [u8]> =
         &cyw43::Aligned(*cyw43_firmware::CYW43_43439A0);
@@ -232,10 +245,14 @@ async fn start(spawner: Spawner, wifi: WifiBoard, bootsel: Peri<'static, periphe
     static DEVICE: StaticCell<Device<'static>> = StaticCell::new();
     let device = DEVICE.init(Device::new(DEVICE_ID, DEVICE_NAME, kek, seed));
     let server_endpoint = IpEndpoint::from(server);
-    info!(
-        "talking to {} as {}; hold BOOTSEL to talk",
-        SERVER, DEVICE_ID
-    );
+    info!("talking to {} as {}", SERVER, DEVICE_ID);
+    if cfg!(feature = "always-on") {
+        info!("microphone always on");
+    } else if !cfg!(feature = "listen-only") {
+        info!("hold BOOTSEL to talk");
+    }
+    #[cfg(feature = "cpu-load")]
+    spawner.spawn(unwrap!(load::report(baseline)));
 
     run(device, &mut socket, server_endpoint, bootsel).await
 }
@@ -278,10 +295,16 @@ async fn run(
             Either::First(captured) => {
                 let now = Instant::now().as_millis();
                 let talking = !cfg!(feature = "listen-only")
-                    && embassy_rp::bootsel::is_bootsel_pressed(bootsel.reborrow());
+                    && (cfg!(feature = "always-on")
+                        || embassy_rp::bootsel::is_bootsel_pressed(bootsel.reborrow()));
+                // Push-to-talk is half duplex: the speaker stays quiet while
+                // the button is held, so the microphone doesn't send the room
+                // back to itself.
+                let muted = talking && !cfg!(feature = "always-on");
                 let capture: Option<&Frame> = if talking { Some(&captured) } else { None };
                 outbox.used = 0;
                 let heard = device.tick(now, capture, &mut |d| outbox.push(d));
+                let heard = heard.filter(|_| !muted);
                 audio::PLAYBACK.signal(heard.unwrap_or([0; FRAME_SAMPLES]));
                 for (datagram, len) in &outbox.slots[..outbox.used] {
                     if socket.send_to(&datagram[..*len], server).await.is_err() {
