@@ -1,5 +1,12 @@
 # embedded-rtp
 
+[![crates.io](https://img.shields.io/crates/v/embedded-rtp.svg)](https://crates.io/crates/embedded-rtp)
+[![docs.rs](https://img.shields.io/docsrs/embedded-rtp)](https://docs.rs/embedded-rtp)
+[![CI](https://github.com/jcorrie/embedded-rtp/actions/workflows/ci.yml/badge.svg)](https://github.com/jcorrie/embedded-rtp/actions/workflows/ci.yml)
+[![MSRV 1.81](https://img.shields.io/badge/MSRV-1.81-blue.svg)](#installation)
+[![no_std](https://img.shields.io/badge/no__std-yes-green.svg)](#features)
+[![License: MIT OR Apache-2.0](https://img.shields.io/crates/l/embedded-rtp.svg)](#licence)
+
 Real-time audio over RTP for microcontrollers and servers, from one crate.
 It is `no_std`, needs no allocator, uses no floating point, has no
 dependencies by default and forbids `unsafe`. Besides parsing and writing
@@ -99,18 +106,28 @@ Not supported (yet):
 
 ## Installation
 
+From [crates.io](https://crates.io/crates/embedded-rtp):
+
+```sh
+cargo add embedded-rtp
+cargo add embedded-rtp --features srtp   # with SRTP and SRTCP
+```
+
+or in `Cargo.toml`:
+
 ```toml
 [dependencies]
 embedded-rtp = "0.1"
-```
-
-For SRTP, turn on the `srtp` feature:
-
-```toml
+# or, with SRTP:
 embedded-rtp = { version = "0.1", features = ["srtp"] }
 ```
 
-While the version is 0.x, a minor version (0.1 to 0.2) may break the API.
+It needs Rust 1.81 or later, and builds for any target, `no_std` ones such
+as `thumbv6m-none-eabi` included. API documentation is on
+[docs.rs](https://docs.rs/embedded-rtp). While the version is 0.x, a minor
+version (0.1 to 0.2) may break the API; see the
+[releases](https://github.com/jcorrie/embedded-rtp/releases) for what
+changed.
 
 ## Quick start
 
@@ -836,25 +853,19 @@ crate's own code.
 
 ## Releasing
 
-Pushing a version tag publishes it. `.github/workflows/release.yml` runs the
-whole of CI, checks that the tag matches `Cargo.toml` and is on `main`,
-publishes to crates.io, and makes a GitHub release with notes from the
-merged pull requests.
+Merging a version bump releases it. In a pull request, bump `version` in
+`Cargo.toml` (0.x: a minor bump for breaking changes, a patch bump
+otherwise) and update the lock files with `cargo update -p embedded-rtp` in
+the root, `fuzz/` and `examples/pico-w/`. When it merges,
+`.github/workflows/release.yml` sees a version on `main` with no tag yet,
+runs the whole of CI, publishes to crates.io, then tags the commit
+(`v0.2.0`) and makes a GitHub release with notes from the merged pull
+requests. A version with a pre-release part (`0.2.0-rc.1`) makes a
+pre-release.
 
-1. In a pull request, bump `version` in `Cargo.toml` (0.x: a minor bump for
-   breaking changes, a patch bump otherwise), then merge it.
-2. Tag the merge on `main` and push the tag:
-
-   ```sh
-   git switch main && git pull
-   git tag v0.2.0 && git push origin v0.2.0
-   ```
-
-A tag with a pre-release part (`v0.2.0-rc.1`) makes a pre-release. If the
-publish works but the GitHub release step fails, rerunning the job fails
-too, because the version is already on crates.io; make the release by hand
-with `gh release create v0.2.0 --verify-tag --generate-notes`, adding
-`--prerelease` for a pre-release tag.
+If a release fails part way, rerun it from the Actions tab (or with "Run
+workflow" on the release workflow): a version already on crates.io isn't
+published twice, so the rerun goes on to the tag and release.
 
 crates.io publishes through Trusted Publishing, so no token is stored. Its
 settings for the crate name this repository, the workflow `release.yml` and
