@@ -781,11 +781,16 @@ pass:
   phase, no sample step exceeds the designed bound.
 - **Planted bugs.** Bugs planted by hand (wrong byte order, off-by-one
   limits, wrong jitter gain and so on) were caught by the suite.
+- **Fuzzing.** `cargo fuzz` targets for the RTP and RTCP readers check that
+  they never panic and keep every slice inside the input. Header fields,
+  and every SR, RR, SDES and BYE, must also write back the same. They run in CI on pull requests touching
+  the readers, and weekly.
 
 ```sh
 cargo test --all-features                                               # everything except interop
 cargo test --all-features --test interop -- --ignored --test-threads=1  # needs ffmpeg and GStreamer
 cargo build --release --target thumbv6m-none-eabi        # the embedded build
+cd fuzz && cargo +nightly fuzz run rtcp_compound          # or rtp_packet; needs cargo-fuzz
 ```
 
 The interop tests are Unix only. On Debian or Ubuntu they need
@@ -806,7 +811,6 @@ From the [milestones](docs/design.md#milestones) in the design document:
 | [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
 | [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |
 | [#15](https://github.com/jcorrie/embedded-rtp/issues/15) | End-to-end key agreement for direct calls | Low until needed |
-| [#6](https://github.com/jcorrie/embedded-rtp/issues/6) | Fuzzing | Low |
 
 [docs/design.md](docs/design.md) explains the design: why existing crates
 don't fit, the algorithms, the memory budget, server integration and

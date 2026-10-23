@@ -631,8 +631,16 @@ because a misreading shared by both halves would pass. See issue #1.
   misorder limit off by one, duplicates not counted, the wrong jitter gain, no
   24-bit clamp, the wrong fraction scaling.
 - **Embedded build.** CI runs `cargo build --target thumbv6m-none-eabi`.
-- **Fuzzing (later, #6).** `cargo fuzz` targets for `Packet::parse` and the
-  RTCP reader.
+- **Fuzzing (#6).** `cargo fuzz` targets in `fuzz/` for `Packet::parse`
+  and `rtcp::Compound::parse`: neither may panic or hand out a slice outside
+  its input. A parsed RTP header, written back bare, must keep the input's
+  V, M, PT, sequence, timestamp and SSRC. Every SR, RR, SDES and BYE
+  accepted, written again with `Writer`, must parse to the same contents;
+  other packet types (APP, feedback) are only checked for bounds, as
+  `Writer` can't write them. CI runs each for a minute on pull requests
+  that touch the readers, and for 20 minutes weekly. The first runs found
+  one bug: a BYE with a zero reason length followed by non-zero bytes was
+  accepted, its "padding" never checked.
 
 ## Milestones
 
@@ -658,7 +666,6 @@ Further work, by priority:
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |
 | #15 | End-to-end key agreement for direct calls | Low until needed |
-| #6 | Fuzzing | Low |
 
 ## Decisions
 
