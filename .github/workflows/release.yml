@@ -18,9 +18,11 @@ on:
 permissions:
   contents: read
 
-# One release run at a time. A run that waits here and is replaced by a
-# newer push loses nothing: the newer run reads the version from main and
-# finds it untagged just the same.
+# One release run at a time. A run waiting here that a newer push replaces
+# hands over to it: the newer run releases whatever version main has then.
+# So if two version bumps land while a release is running, only the later
+# is published; it carries the earlier one's changes, and its notes cover
+# every pull request since the last tag.
 concurrency:
   group: release
   cancel-in-progress: false
