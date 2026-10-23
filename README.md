@@ -85,7 +85,7 @@ Done:
   guide (#4);
 - a Pico W intercom device, built in CI, with per-frame costs counted on
   ARMv6-M under QEMU (#5). It still needs trying on hardware;
-- an echo suppressor for full duplex, about 40 instructions a sample on a
+- an echo suppressor for full duplex, about 43 instructions a sample on a
   Cortex-M0+ (#9).
 
 Not supported (yet):
@@ -414,15 +414,14 @@ payload type 96, RTP and RTCP on one UDP port.
 
 **Device, every 20 ms tick:**
 
-1. Capture 320 samples into the packet buffer after the 12-byte header,
-   then `Sender::send_in_place` and `Outbound::protect_rtp`. Send.
-   Nothing to say? Call `Sender::skip` and send nothing.
+1. Capture 320 samples into the packet buffer after the 12-byte header.
+   On a full-duplex device, run them through `Ducker::process` with what
+   the speaker played, which turns down the echo the room would otherwise
+   hear (push-to-talk devices, which mute the speaker while sending, don't
+   need it). Then `Sender::send_in_place` and `Outbound::protect_rtp`.
+   Send. Nothing to say? Call `Sender::skip` and send nothing.
 2. Play `concealer.play(receiver.play())`. `None` means silence; keep the
    output clock running either way.
-3. Full duplex? Before step 1, run the captured frame through
-   `Ducker::process` with what the speaker played, so the room doesn't
-   hear itself back. Push-to-talk devices, which mute the speaker while
-   sending, don't need it.
 
 **Device, on each datagram:**
 

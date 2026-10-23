@@ -256,12 +256,75 @@ fn block_size_does_not_matter() {
 
 #[test]
 fn short_playback_counts_as_silence() {
-    let config = Config::DEFAULT;
+    let config = Config {
+        attack: 0,
+        hold: 10,
+        release: 20,
+        ..Config::DEFAULT
+    };
+    let (one, ducked) = (i32::from(UNITY), i32::from(config.ducked_gain));
+    // Duck it, then give 5 samples of loud playback for 100 of microphone:
+    // the other 95 count as silence, so it holds and then releases over
+    // them, exactly as for 95 samples of real silence.
     let mut ducker = Ducker::new(config);
-    let mut mic = vec![DC; 320];
-    // No playback at all: untouched.
-    ducker.process(&[], &mut mic);
-    assert!(mic.iter().all(|&s| s == DC));
+    gains(&mut ducker, &[20_000; 10]);
+    let mut mic = vec![DC; 100];
+    let mut reference = mic.clone();
+    let mut twin = ducker.clone();
+    ducker.process(&[20_000; 5], &mut mic);
+    let mut padded = vec![0i16; 100];
+    padded[..5].fill(20_000);
+    twin.process(&padded, &mut reference);
+    assert_eq!(mic, reference);
+    let gain: Vec<i32> = mic.iter().map(|&s| -i32::from(s)).collect();
+    // Loud to sample 4, held for 10 more, releasing from sample 15.
+    assert!(gain[..15].iter().all(|&g| g == ducked));
+    assert!(gain[15] > ducked);
+    assert!(gain[35..].iter().all(|&g| g == one));
+    // And none at all: the same as silence.
+    let mut none = vec![DC; 50];
+    Ducker::new(config).process(&[], &mut none);
+    assert!(none.iter().all(|&s| s == DC));
+}
+
+#[test]
+fn zero_threshold_never_ducks_on_silence() {
+    let config = Config {
+        threshold: 0,
+        attack: 0,
+        hold: 0,
+        release: 0,
+        ..Config::DEFAULT
+    };
+    let (one, ducked) = (i32::from(UNITY), i32::from(config.ducked_gain));
+    let gain = gains(&mut Ducker::new(config), &[0, 0, 1, -1, 0]);
+    assert_eq!(gain, [one, one, ducked, ducked, one]);
+}
+
+#[test]
+fn long_fades_take_as_long_as_asked() {
+    // A 24 dB fade over a minute (960,000 samples) at 16 kHz: halfway at
+    // half the time, and down within the configured time, not much sooner.
+    let attack = 960_000;
+    let config = Config {
+        attack,
+        hold: u32::MAX,
+        ..Config::DEFAULT
+    };
+    let (one, ducked) = (i32::from(UNITY), i32::from(config.ducked_gain));
+    let played = vec![20_000i16; attack as usize + 1_000];
+    let gain = gains(&mut Ducker::new(config), &played);
+    let half = (one + ducked) / 2;
+    let midpoint = gain[attack as usize / 2];
+    assert!(
+        (midpoint - half).abs() <= 2,
+        "{midpoint} at half time, {half} expected"
+    );
+    let reached = gain.iter().position(|&g| g == ducked).unwrap();
+    assert!(
+        reached <= attack as usize && reached >= attack as usize * 999 / 1_000,
+        "down after {reached} samples, {attack} configured"
+    );
 }
 
 #[test]

@@ -30,7 +30,10 @@
 
 /// Unity gain in Q15.
 pub const UNITY: u16 = 1 << 15;
-const ONE: i32 = UNITY as i32;
+/// Gains are kept with 16 more bits than Q15, so a fade's per-sample step
+/// can be tiny and a long attack or release still takes as long as asked.
+const FINE: u32 = 16;
+const ONE: u32 = (UNITY as u32) << FINE;
 
 /// `10^(-1/20)` in Q15: one decibel down.
 const ONE_DB_DOWN: u32 = 29_205;
@@ -55,7 +58,8 @@ pub const fn gain_from_db(db: u8) -> u16 {
 pub struct Config {
     /// Playback level, as a sample's magnitude, at or above which the
     /// microphone is turned down. Below it, playback is too quiet to come
-    /// back as an audible echo.
+    /// back as an audible echo. Zero counts as one: digital silence never
+    /// turns the microphone down.
     pub threshold: u16,
     /// Microphone gain while turned down, Q15, at most [`UNITY`]. See
     /// [`gain_from_db`].
@@ -96,12 +100,12 @@ impl Default for Config {
 #[derive(Debug, Clone)]
 pub struct Ducker {
     threshold: u16,
-    ducked: i32,
+    /// Gains and steps carry `FINE` extra bits.
+    ducked: u32,
     hold: u32,
-    attack_step: i32,
-    release_step: i32,
-    /// Current gain, Q15.
-    gain: i32,
+    attack_step: u32,
+    release_step: u32,
+    gain: u32,
     /// Samples of hold left.
     holding: u32,
 }
@@ -122,9 +126,13 @@ impl Ducker {
     #[must_use]
     pub const fn new(config: Config) -> Self {
         assert!(config.ducked_gain <= UNITY, "ducked_gain is at most UNITY");
-        let ducked = config.ducked_gain as i32;
+        let ducked = (config.ducked_gain as u32) << FINE;
         Self {
-            threshold: config.threshold,
+            threshold: if config.threshold == 0 {
+                1
+            } else {
+                config.threshold
+            },
             ducked,
             hold: config.hold,
             attack_step: step(ONE - ducked, config.attack),
@@ -153,20 +161,21 @@ impl Ducker {
                 false
             };
             if down {
-                self.gain = (self.gain - self.attack_step).max(self.ducked);
+                self.gain = self.gain.saturating_sub(self.attack_step).max(self.ducked);
             } else {
-                self.gain = (self.gain + self.release_step).min(ONE);
+                self.gain = self.gain.saturating_add(self.release_step).min(ONE);
             }
             // |sample| * gain <= 2^15 * 2^15: no overflow, and the result
             // fits an i16 since gain <= unity.
-            *sample = ((i32::from(*sample) * self.gain) >> 15) as i16;
+            let gain = (self.gain >> FINE) as i32;
+            *sample = ((i32::from(*sample) * gain) >> 15) as i16;
         }
     }
 
     /// The current microphone gain, Q15.
     #[must_use]
     pub fn gain(&self) -> u16 {
-        self.gain as u16
+        (self.gain >> FINE) as u16
     }
 
     /// Whether the microphone is turned down at all.
@@ -177,17 +186,14 @@ impl Ducker {
 }
 
 /// The per-sample step to cover `span` in `samples` samples, rounded up so
-/// the fade never takes longer.
-const fn step(span: i32, samples: u32) -> i32 {
+/// the fade never takes longer. With the `FINE` bits, the rounding is under
+/// 0.05% for a fade of a million samples, and a 24 dB fade can last over a
+/// day.
+const fn step(span: u32, samples: u32) -> u32 {
     if samples == 0 || span == 0 {
         return ONE;
     }
-    let samples = if samples > ONE as u32 {
-        ONE
-    } else {
-        samples as i32
-    };
-    let step = (span + samples - 1) / samples;
+    let step = span.div_ceil(samples);
     if step < 1 {
         1
     } else {

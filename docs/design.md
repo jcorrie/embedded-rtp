@@ -323,12 +323,16 @@ to the server it is new audio.
   in the microphone (audio buffers and the air) and the room's echo tail.
   With a 100 ms hold, gaps between syllables don't let the gain pump.
 - Q15 gain, one multiply a sample, no division: the steps are worked out
-  once in the `const` constructor. Unity gain passes samples through bit
+  once in the `const` constructor. The gain is held with 16 more bits than
+  it is applied with, so a fade's step can be tiny and a long attack or
+  release (up to a day) takes as long as configured, within 0.05% for a
+  minute's fade. Unity gain passes samples through bit
   for bit. `gain_from_db` turns decibels into a Q15 gain at compile time.
 - `Config::DEFAULT`, for 16 kHz: above about -30 dBFS, 24 dB down within
   2 ms, back over 100 ms after 100 ms of quiet.
-- Cost: about 13,000 ARMv6-M instructions a frame, 40 a sample: 0.5% of a
-  125 MHz M0+. State is a few words.
+- Cost: about 13,600 ARMv6-M instructions a frame, 43 a sample: at 1.3 to
+  1.6 cycles an instruction, 0.7 to 0.9% of a 125 MHz M0+. State is a few
+  words.
 - A suppressor, not a canceller: while the far end talks, the near end is
   turned down too. An adaptive (NLMS) canceller would allow real double
   talk, but costs a multiply-accumulate per filter tap per sample: 64 taps
@@ -500,7 +504,7 @@ instructions.
 | L16 encode and RTP header (`send_in_place`) | 1,040 |
 | Parse, receive, play | 1,160 |
 | Concealment: good frame / lost frame then good | 2,440 / 7,480 |
-| Echo suppressor (`duck`), full duplex only | 12,960 |
+| Echo suppressor (`duck`), full duplex only | 13,600 |
 | SRTP protect, 652 bytes | 137,080 |
 | SRTP unprotect, 662 bytes | 137,440 |
 | SRTP tag check only (a forged packet) | 29,000 |
