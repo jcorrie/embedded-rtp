@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "embedded-rtp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes",
  "aes-kw",
