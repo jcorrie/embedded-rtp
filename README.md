@@ -782,8 +782,8 @@ pass:
 - **Planted bugs.** Bugs planted by hand (wrong byte order, off-by-one
   limits, wrong jitter gain and so on) were caught by the suite.
 - **Fuzzing.** `cargo fuzz` targets for the RTP and RTCP readers check that
-  they never panic, keep every slice inside the input, and that what they
-  accept writes back the same. They run in CI on pull requests touching
+  they never panic and keep every slice inside the input. Header fields,
+  and every SR, RR, SDES and BYE, must also write back the same. They run in CI on pull requests touching
   the readers, and weekly.
 
 ```sh
