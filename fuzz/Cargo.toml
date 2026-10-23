@@ -1,0 +1,30 @@
+[package]
+name = "embedded-rtp-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+embedded-rtp = { path = ".." }
+
+# Its own workspace, so the library's builds never see it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "rtp_packet"
+path = "fuzz_targets/rtp_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtcp_compound"
+path = "fuzz_targets/rtcp_compound.rs"
+test = false
+doc = false
+bench = false

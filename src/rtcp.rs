@@ -319,15 +319,19 @@ fn decode(raw: Raw<'_>) -> Result<Packet<'_>, Error> {
             let sources = body.get(..ids).ok_or(Error::Truncated)?;
             let rest = &body[ids..];
             // An optional reason: a length octet and text. Anything after it
-            // is padding to the 32-bit boundary, which must be zero.
-            let reason = match rest.first() {
-                None => None,
-                Some(&0) if rest.iter().all(|&b| b == 0) => None,
+            // is padding to the 32-bit boundary, which must be zero, as in
+            // SDES chunks. A zero length is no reason.
+            let (reason, padding) = match rest.first() {
+                None | Some(&0) => (None, rest),
                 Some(&len) => {
-                    let len = usize::from(len);
-                    Some(rest.get(1..1 + len).ok_or(Error::Truncated)?)
+                    let end = 1 + usize::from(len);
+                    let text = rest.get(1..end).ok_or(Error::Truncated)?;
+                    (Some(text), &rest[end..])
                 }
             };
+            if padding.iter().any(|&b| b != 0) {
+                return Err(Error::Truncated);
+            }
             Ok(Packet::Goodbye {
                 sources: Sources { bytes: sources },
                 reason,

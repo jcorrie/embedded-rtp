@@ -1,0 +1,40 @@
+# Fuzz the RTP and RTCP readers (fuzz/). A minute each on pull requests
+# that touch them; longer every week. Kept out of ci.yml so its apt cache
+# key doesn't change with this file.
+name: fuzz
+
+on:
+  pull_request:
+    paths:
+      - src/lib.rs
+      - src/packet.rs
+      - src/rtcp.rs
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [rtp_packet, rtcp_compound]
+    env:
+      SECONDS_EACH: ${{ github.event_name == 'pull_request' && 60 || 1200 }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=$SECONDS_EACH -max_len=1500
+        working-directory: fuzz
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/

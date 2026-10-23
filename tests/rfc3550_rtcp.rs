@@ -329,6 +329,29 @@ fn counts_that_overrun_the_packet_are_rejected() {
 }
 
 #[test]
+fn bye_padding_must_be_zero() {
+    // Found by fuzzing: a zero reason length followed by junk read as an
+    // empty reason, which writes back as none.
+    let bye = |rest: &[u8]| [empty_rr(), [&[0x81, 203, 0, 2, 0, 0, 0, 1], rest].concat()].concat();
+    assert_eq!(Compound::parse(&bye(&[0, 0, 0, 7])), Err(Error::Truncated));
+    // After a reason too.
+    assert_eq!(
+        Compound::parse(&bye(&[1, b'x', 0, 7])),
+        Err(Error::Truncated)
+    );
+    match packets(&bye(&[0, 0, 0, 0]))[..] {
+        [_, Packet::Goodbye { reason: None, .. }] => {}
+        ref other => panic!("{other:?}"),
+    }
+    match packets(&bye(&[1, b'x', 0, 0]))[..] {
+        [_, Packet::Goodbye {
+            reason: Some(b"x"), ..
+        }] => {}
+        ref other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn other_packet_types_pass_through() {
     let app = [0x81, 204, 0, 2, 0, 0, 0, 1, b'n', b'a', b'm', b'e'];
     match packets(&[empty_rr(), app.to_vec()].concat())[..] {
