@@ -16,6 +16,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use embedded_rtp::duck::{self, Ducker};
 use embedded_rtp::jitter::{Config, JitterBuffer, Playout};
 use embedded_rtp::l16::{self, Concealer};
 use embedded_rtp::packet::{self, Header, Packet};
@@ -161,6 +162,15 @@ fn concealment(c: &mut Criterion) {
     let mut out = [0u8; FRAME_BYTES];
     group.bench_function("encode", |b| {
         b.iter(|| l16::encode(black_box(&samples), &mut out))
+    });
+
+    // The echo suppressor on one frame, ducking: the multiply always runs,
+    // so this is its cost whatever the signals.
+    let loud = [12_000i16; FRAME_SAMPLES];
+    let mut ducker = Ducker::new(duck::Config::DEFAULT);
+    let mut mic = [3_000i16; FRAME_SAMPLES];
+    group.bench_function("duck", |b| {
+        b.iter(|| ducker.process(black_box(&loud), black_box(&mut mic)))
     });
 
     // The no-loss path: decode, nothing else.

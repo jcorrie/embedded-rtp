@@ -106,6 +106,7 @@ embedded-rtp
 ├── receiver   stats + jitter buffer + SSRC handling
 ├── sender     sequence/timestamp/marker bookkeeping
 ├── l16        PCM16 encode/decode, simple loss concealment
+├── duck       echo suppressor: microphone down while the speaker plays
 └── srtp       SRTP/SRTCP and key wrap (optional `srtp` feature)
 ```
 
@@ -307,6 +308,38 @@ For the intercom, these RTCP messages replace ad-hoc control traffic:
     phase, no sample step exceeds the bound the design implies, and naive
     concealment demonstrably breaks that bound.
 
+### `duck`
+
+An echo suppressor for full-duplex devices (#9). A device's speaker comes
+back through its microphone, and the server's mix-minus can't remove it:
+to the server it is new audio.
+
+- `Ducker::process(played, mic)` runs once a frame, before sending. Per
+  sample: if the speaker's sample is at or above `threshold`, restart a
+  hold counter. While playing or holding, the microphone gain falls towards
+  `ducked_gain`; otherwise it rises back to unity. Both move linearly, over
+  `attack` and `release` samples.
+- `hold` covers the delay from handing a frame to the speaker to hearing it
+  in the microphone (audio buffers and the air) and the room's echo tail.
+  With a 100 ms hold, gaps between syllables don't let the gain pump.
+- Q15 gain, one multiply a sample, no division: the steps are worked out
+  once in the `const` constructor. Unity gain passes samples through bit
+  for bit. `gain_from_db` turns decibels into a Q15 gain at compile time.
+- `Config::DEFAULT`, for 16 kHz: above about -30 dBFS, 24 dB down within
+  2 ms, back over 100 ms after 100 ms of quiet.
+- Cost: about 13,000 ARMv6-M instructions a frame, 40 a sample: 0.5% of a
+  125 MHz M0+. State is a few words.
+- A suppressor, not a canceller: while the far end talks, the near end is
+  turned down too. An adaptive (NLMS) canceller would allow real double
+  talk, but costs a multiply-accumulate per filter tap per sample: 64 taps
+  (4 ms of echo path) would be about 20 times the suppressor. Only worth it
+  if suppression proves not enough.
+- Tested on synthetic signals: below the threshold the microphone is
+  untouched, above it attenuated by the configured decibels (against a
+  floating-point reference, within 0.1 dB); attack, hold and release times
+  measured from the output; no overflow at any extreme; block size makes no
+  difference.
+
 ### `srtp`
 
 SRTP and SRTCP (RFC 3711) with the default suite, `AES_CM_128_HMAC_SHA1_80`,
@@ -467,6 +500,7 @@ instructions.
 | L16 encode and RTP header (`send_in_place`) | 1,040 |
 | Parse, receive, play | 1,160 |
 | Concealment: good frame / lost frame then good | 2,440 / 7,480 |
+| Echo suppressor (`duck`), full duplex only | 12,960 |
 | SRTP protect, 652 bytes | 137,080 |
 | SRTP unprotect, 662 bytes | 137,440 |
 | SRTP tag check only (a forged packet) | 29,000 |
@@ -659,13 +693,13 @@ Further work, by priority:
 
 | Issue | | Priority |
 |---|---|---|
-| #9 | Echo handling for full duplex | High for full duplex |
 | #10 | Clock drift by samples, not frames | Medium |
 | #11 | Redundant audio (RFC 2198) | Medium |
 | #12 | G.722 codec | Low until bandwidth matters |
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |
 | #15 | End-to-end key agreement for direct calls | Low until needed |
+| #9 | Adaptive echo cancellation (suppression is done) | Low until needed |
 
 ## Decisions
 

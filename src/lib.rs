@@ -16,6 +16,8 @@
 //! - [`rtcp`]: sender and receiver reports, source descriptions and
 //!   goodbyes (RFC 3550 §6).
 //! - [`l16`]: the L16 payload format and packet loss concealment.
+//! - [`duck`]: an echo suppressor for full-duplex devices: the microphone
+//!   is turned down while the speaker plays.
 //! - [`profile`]: an intercom media format: L16, 16 kHz mono, 20 ms frames.
 //! - `srtp` (with the `srtp` feature): SRTP and SRTCP (RFC 3711), to
 //!   authenticate and encrypt both.
@@ -26,6 +28,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod duck;
 pub mod jitter;
 pub mod l16;
 pub mod packet;

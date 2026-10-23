@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use embedded_rtp::duck::{self, Ducker};
 use embedded_rtp::jitter::{Config, Playout};
 use embedded_rtp::l16::{self, Concealer};
 use embedded_rtp::packet::{self, Packet};
@@ -28,6 +29,7 @@ pub struct Workload {
     inbound: Inbound,
     receiver: Receiver<8, FRAME_BYTES>,
     concealer: Concealer<FRAME_SAMPLES>,
+    ducker: Ducker,
     packet: [u8; SRTP_BYTES],
     /// Fresh SRTP packets: replays are rejected, so each run needs its own.
     protected: [[u8; SRTP_BYTES]; RUNS as usize],
@@ -86,6 +88,7 @@ impl Workload {
             inbound: Inbound::new(&key(1)),
             receiver: Receiver::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT),
             concealer: Concealer::new(),
+            ducker: Ducker::new(duck::Config::DEFAULT),
             packet,
             protected,
             device,
@@ -173,6 +176,15 @@ impl Workload {
                 sequence: 0,
                 payload,
             });
+        });
+
+        // Full duplex only: the microphone against what the speaker plays.
+        let ducker = &mut self.ducker;
+        let loud = [12_000i16; FRAME_SAMPLES];
+        time("echo suppressor (duck)", &mut |_| {
+            let mut mic = frame;
+            ducker.process(&loud, &mut mic);
+            core::hint::black_box(mic);
         });
 
         let device = &mut self.device;

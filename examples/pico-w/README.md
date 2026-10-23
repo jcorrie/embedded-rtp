@@ -59,8 +59,10 @@ The log (over the probe) shows the Wi-Fi join, the address it got and
 - `--features listen-only` builds a speaker-only device: no microphone, and
   BOOTSEL is ignored.
 - `--features always-on` sends the microphone all the time: full duplex,
-  with no button. Without echo handling (#9), keep the speaker away from
-  the microphone, or the room hears itself back.
+  with no button. The microphone is turned down by 24 dB while the speaker
+  plays and for 100 ms after (`embedded_rtp::duck`), so the room doesn't
+  hear itself back. Talking over each other works less well than with a
+  phone; keep the speaker pointing away from the microphone.
 - `--features cpu-load` logs the CPU's load every 5 s, everything included
   (audio, Wi-Fi, SRTP). It counts idle-loop iterations against a baseline
   taken at boot, before the audio and Wi-Fi start, and keeps the CPU from
@@ -100,6 +102,7 @@ QEMU's counts for a whole device frame, both directions with SRTP:
 | SRTP unprotect, 662 bytes | 137,440 |
 | Parse, receive, play | 1,160 |
 | Concealment: good frame / lost frame | 2,440 / 7,480 |
+| Echo suppressor, `always-on` only | 12,960 |
 | **Whole frame, both ways** | **279,480** |
 | New SRTP context (key derivation) | 80,320 |
 
