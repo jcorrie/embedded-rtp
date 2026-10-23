@@ -853,7 +853,8 @@ merged pull requests.
 A tag with a pre-release part (`v0.2.0-rc.1`) makes a pre-release. If the
 publish works but the GitHub release step fails, rerunning the job fails
 too, because the version is already on crates.io; make the release by hand
-with `gh release create v0.2.0 --verify-tag --generate-notes`.
+with `gh release create v0.2.0 --verify-tag --generate-notes`, adding
+`--prerelease` for a pre-release tag.
 
 crates.io publishes through Trusted Publishing, so no token is stored. Its
 settings for the crate name this repository, the workflow `release.yml` and
