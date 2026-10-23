@@ -8,7 +8,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/jcorrie/embedded-rtp"
 keywords = ["rtp", "rtcp", "jitter-buffer", "no_std", "embedded"]
 categories = ["embedded", "no-std", "network-programming", "multimedia::audio"]
-# Consumed as a git dependency, not from crates.io.
+# Published from a version tag by .github/workflows/release.yml.
 publish = true
 
 # No dependencies by default: this has to build for a Pico W (thumbv6m, no
