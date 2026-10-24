@@ -10,6 +10,7 @@ use embedded_rtp::jitter::{Config, Playout};
 use embedded_rtp::l16::{self, Concealer};
 use embedded_rtp::packet::{self, Packet};
 use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::red::Encoder;
 use embedded_rtp::srtp::{self, Inbound, MasterKey, Outbound, RTP_OVERHEAD};
 use embedded_rtp::{Receiver, Sender};
 
@@ -19,6 +20,9 @@ use super::device::{Device, Frame, KEYS, KEYS_LEN};
 pub const RUNS: u32 = 16;
 const SRTP_BYTES: usize = PACKET_BYTES + RTP_OVERHEAD;
 const TICKS: u32 = FRAME_SAMPLES as u32;
+const RED_PAYLOAD_TYPE: u8 = 97;
+type RedEncoder = Encoder<1, FRAME_BYTES>;
+const RED_BYTES: usize = packet::HEADER_LEN + RedEncoder::MAX_PAYLOAD + RTP_OVERHEAD;
 
 /// Everything the workload needs, in one place so it can live in a
 /// `static` rather than on a small stack.
@@ -36,6 +40,11 @@ pub struct Workload {
     to_device: [[u8; SRTP_BYTES]; RUNS as usize],
     frame: Frame,
     wrong_key: Inbound,
+    /// Redundancy (RFC 2198) at depth 1, both ends.
+    red_sender: Sender,
+    red_encoder: RedEncoder,
+    red_receiver: Receiver<8, FRAME_BYTES>,
+    red_packet: [u8; RED_BYTES],
 }
 
 fn key(seed: u8) -> MasterKey {
@@ -92,6 +101,11 @@ impl Workload {
             to_device,
             frame,
             wrong_key: Inbound::new(&key(6)),
+            red_sender: Sender::new(1, RED_PAYLOAD_TYPE, TICKS, 0, 0),
+            red_encoder: RedEncoder::new(PAYLOAD_TYPE, TICKS),
+            red_receiver: Receiver::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT)
+                .with_redundancy(RED_PAYLOAD_TYPE, 1),
+            red_packet: [0; RED_BYTES],
         }
     }
 
@@ -159,8 +173,45 @@ impl Workload {
             let _ = receiver.play();
         });
 
-        let concealer = &mut self.concealer;
+        // Redundancy at depth 1: each packet also carries the frame before.
         let payload = &self.packet[packet::HEADER_LEN..PACKET_BYTES];
+        let red_sender = &mut self.red_sender;
+        let red_encoder = &mut self.red_encoder;
+        let red_packet = &mut self.red_packet;
+        let mut red_len = 0;
+        time("red: encode with 1 frame before", &mut |_| {
+            let len = red_encoder
+                .encode(
+                    red_sender.timestamp(),
+                    payload,
+                    &mut red_packet[packet::HEADER_LEN..],
+                )
+                .unwrap();
+            red_len = red_sender.send_in_place(red_packet, len).unwrap();
+        });
+
+        // SRTP's cost grows with the packet, which redundancy doubles.
+        let mut red_outbound = Outbound::new(&key(7));
+        time("red: srtp protect_rtp (1297 B, and a copy)", &mut |_| {
+            let mut copy = *red_packet;
+            red_outbound.protect_rtp(&mut copy, red_len).unwrap();
+            core::hint::black_box(copy);
+        });
+
+        let red_receiver = &mut self.red_receiver;
+        let mut sequence = 0u16;
+        time("red: parse + receive + play", &mut |_| {
+            sequence = sequence.wrapping_add(1);
+            let timestamp = u32::from(sequence) * TICKS;
+            red_packet[2..4].copy_from_slice(&sequence.to_be_bytes());
+            red_packet[4..8].copy_from_slice(&timestamp.to_be_bytes());
+            if let Ok(p) = Packet::parse(&red_packet[..red_len]) {
+                red_receiver.receive(&p, timestamp);
+            }
+            let _ = red_receiver.play();
+        });
+
+        let concealer = &mut self.concealer;
         time("concealer: good frame (decode)", &mut |_| {
             let _ = concealer.play(Playout::Frame {
                 sequence: 0,
