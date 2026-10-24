@@ -67,6 +67,7 @@ intercom: Pico W devices talking to a server over UDP.
 | [`Receiver`](src/receiver.rs) / [`Sender`](src/sender.rs) | The above wired together for one incoming and one outgoing stream. This is what most code uses. |
 | [`rtcp`](src/rtcp.rs) | RTCP (RFC 3550 §6): read and write compound packets with SR, RR, SDES and BYE, validated per appendix A.2. Round-trip times from report blocks. |
 | [`l16`](src/l16.rs) | Big-endian PCM16 encode/decode (RFC 3551 §4.5.11) and `Concealer`, which turns playout into samples and fades over lost frames without clicks. |
+| [`duck`](src/duck.rs) | An echo suppressor for full-duplex devices: `Ducker` turns the microphone down while the speaker plays, with attack, hold and release times. |
 | [`red`](src/red.rs) | Redundant audio (RFC 2198): each packet also carries the frame or frames before it, so a lost frame is recovered exactly from the next packet. |
 | [`srtp`](src/srtp.rs) | SRTP and SRTCP (RFC 3711), `AES_CM_128_HMAC_SHA1_80`, in place on the packet buffer, with replay protection and seamless rekeying. AES key wrap (RFC 5649) to deliver session keys without TLS. Behind the `srtp` feature. |
 | [`profile`](src/profile.rs) | Constants for an intercom format: L16, 16 kHz mono, 20 ms frames, payload type 96. Nothing else depends on them. |
@@ -86,7 +87,9 @@ Done:
 - an intercom: mixing server and desktop client examples, with a server
   guide (#4);
 - a Pico W intercom device, built in CI, with per-frame costs counted on
-  ARMv6-M under QEMU (#5). It still needs trying on hardware.
+  ARMv6-M under QEMU (#5). It still needs trying on hardware;
+- an echo suppressor for full duplex, about 43 instructions a sample on a
+  Cortex-M0+ (#9).
 
 Not supported (yet):
 
@@ -97,7 +100,9 @@ Not supported (yet):
 - **L16 only** for decoding and concealment. The payload is opaque to
   `Receiver` and `Sender`, so you can carry other formats, but G.722 support
   is still to come ([#12](https://github.com/jcorrie/embedded-rtp/issues/12)).
-- **No echo cancellation** for full duplex
+- **Echo suppression, not cancellation.** `duck` turns the microphone
+  down while the speaker plays, so talking over each other works less well
+  than in a phone call. An adaptive echo canceller is a possible later step
   ([#9](https://github.com/jcorrie/embedded-rtp/issues/9)).
 - Frames must all have the same duration
   ([#13](https://github.com/jcorrie/embedded-rtp/issues/13)), and clock drift
@@ -484,7 +489,12 @@ payload type 96, RTP and RTCP on one UDP port.
 
 1. Capture 320 samples into the packet buffer after the 12-byte header,
    then `Sender::send_in_place` and `Outbound::protect_rtp`. Send.
-   Nothing to say? Call `Sender::skip` and send nothing.
+   Nothing to say? Call `Sender::skip` and send nothing. On a full-duplex
+   device, capture into an `i16` frame instead and run it through
+   `Ducker::process` with what the speaker played, which turns down the
+   echo the other end would hear; then `l16::encode` it into the packet
+   buffer and carry on as above. (Push-to-talk devices, which mute the
+   speaker while sending, don't need it.)
 2. Play `concealer.play(receiver.play())`. `None` means silence; keep the
    output clock running either way.
 
@@ -917,12 +927,12 @@ From the [milestones](docs/design.md#milestones) in the design document:
 
 | Issue | | Priority |
 |---|---|---|
-| [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Echo handling for full duplex | High for full duplex |
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
 | [#12](https://github.com/jcorrie/embedded-rtp/issues/12) | G.722 codec | Low until bandwidth matters |
 | [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
 | [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |
 | [#15](https://github.com/jcorrie/embedded-rtp/issues/15) | End-to-end key agreement for direct calls | Low until needed |
+| [#9](https://github.com/jcorrie/embedded-rtp/issues/9) | Adaptive echo cancellation (suppression is done) | Low until needed |
 
 [docs/design.md](docs/design.md) explains the design: why existing crates
 don't fit, the algorithms, the memory budget, server integration and

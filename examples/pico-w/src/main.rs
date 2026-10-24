@@ -35,6 +35,8 @@ use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use device::{Device, Frame, DATAGRAM_MAX};
+#[cfg(feature = "always-on")]
+use embedded_rtp::duck::{self, Ducker};
 use embedded_rtp::profile::FRAME_SAMPLES;
 
 bind_interrupts!(struct Irqs {
@@ -287,11 +289,22 @@ async fn run(
     });
     let mut buf = [0u8; DATAGRAM_MAX];
     let mut joined = false;
+    // Full duplex: the microphone is turned down while the speaker plays,
+    // so the room doesn't hear itself back (#9). It is compared with the
+    // frame handed to the speaker last tick, which plays a little before
+    // its echo is captured; the hold (100 ms) covers the difference.
+    #[cfg(feature = "always-on")]
+    let mut ducker = Ducker::new(duck::Config::DEFAULT);
+    #[cfg(feature = "always-on")]
+    let mut played: Frame = [0; FRAME_SAMPLES];
     loop {
         match select(audio::CAPTURED.receive(), socket.recv_from(&mut buf)).await {
             // The audio clock ticks every 20 ms: send what was captured, play
             // what has arrived.
-            Either::First(captured) => {
+            #[allow(unused_mut)]
+            Either::First(mut captured) => {
+                #[cfg(feature = "always-on")]
+                ducker.process(&played, &mut captured);
                 let now = Instant::now().as_millis();
                 let talking = !cfg!(feature = "listen-only")
                     && (cfg!(feature = "always-on")
@@ -303,10 +316,15 @@ async fn run(
                 // Half duplex: while BOOTSEL is held the speaker is quiet, so
                 // the microphone doesn't send the room back to everyone.
                 let muted = talking && !cfg!(feature = "always-on");
-                audio::PLAYBACK.signal(match heard {
+                let frame = match heard {
                     Some(frame) if !muted => frame,
                     _ => [0; FRAME_SAMPLES],
-                });
+                };
+                #[cfg(feature = "always-on")]
+                {
+                    played = frame;
+                }
+                audio::PLAYBACK.signal(frame);
                 for (datagram, len) in &outbox.slots[..outbox.used] {
                     if socket.send_to(&datagram[..*len], server).await.is_err() {
                         warn!("send failed");

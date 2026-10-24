@@ -26,8 +26,8 @@ rom-intrinsics = ["embassy-rp/intrinsics", "embassy-rp/rom-func-cache"]
 # No microphone: only listen.
 listen-only = []
 # Send the microphone all the time instead of while BOOTSEL is held: full
-# duplex. Without echo handling (#9), anyone near the speaker is sent back
-# to the room.
+# duplex, with the echo suppressor turning the microphone down while the
+# speaker plays.
 always-on = []
 # Log the CPU's load every 5 s, everything included, by counting idle-loop
 # iterations. Keeps the CPU from sleeping, so only for measuring.
