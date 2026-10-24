@@ -18,6 +18,7 @@
 //! - [`l16`]: the L16 payload format and packet loss concealment.
 //! - [`duck`]: an echo suppressor for full-duplex devices: the microphone
 //!   is turned down while the speaker plays.
+//! - [`red`]: redundant audio (RFC 2198), to recover lost frames exactly.
 //! - [`profile`]: an intercom media format: L16, 16 kHz mono, 20 ms frames.
 //! - `srtp` (with the `srtp` feature): SRTP and SRTCP (RFC 3711), to
 //!   authenticate and encrypt both.
@@ -34,6 +35,7 @@ pub mod l16;
 pub mod packet;
 pub mod profile;
 mod receiver;
+pub mod red;
 pub mod rtcp;
 mod sender;
 #[cfg(feature = "srtp")]

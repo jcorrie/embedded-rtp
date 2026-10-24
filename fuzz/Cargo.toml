@@ -28,3 +28,10 @@ path = "fuzz_targets/rtcp_compound.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "red_payload"
+path = "fuzz_targets/red_payload.rs"
+test = false
+doc = false
+bench = false
