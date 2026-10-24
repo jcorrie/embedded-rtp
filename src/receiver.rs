@@ -2,6 +2,7 @@
 
 use crate::jitter::{Config, Counters, JitterBuffer, Playout, Push};
 use crate::packet::Packet;
+use crate::red;
 use crate::rtcp::{self, ReportBlock, SenderInfo};
 use crate::stats::{Report, SeqStatus, SourceStats};
 
@@ -25,6 +26,9 @@ pub enum Received {
     Duplicate,
     /// Larger than a frame slot. Dropped.
     Oversized,
+    /// A redundant payload (RFC 2198) whose headers run past its end.
+    /// Dropped.
+    Malformed,
 }
 
 impl From<Push> for Received {
@@ -44,9 +48,17 @@ impl From<Push> for Received {
 /// arrives, and call [`Receiver::play`] once per frame period. A new SSRC, or
 /// a sequence number jump confirmed as a sender restart, starts the stream
 /// afresh.
+///
+/// Set up with [`with_redundancy`](Self::with_redundancy), it also takes
+/// redundant packets (RFC 2198, see [`red`]) and recovers lost frames from
+/// them.
 pub struct Receiver<const SLOTS: usize, const FRAME: usize> {
     payload_type: u8,
     frame_ticks: u32,
+    /// The `red` payload type, if redundant packets are expected.
+    red_payload_type: Option<u8>,
+    /// Frames added to the target depth while redundant packets arrive.
+    red_wait: u8,
     ssrc: Option<u32>,
     /// The last sender report from the remote end: its SSRC, the NTP short
     /// form of its timestamp, and when it arrived (NTP short, our clock).
@@ -64,6 +76,8 @@ impl<const SLOTS: usize, const FRAME: usize> Receiver<SLOTS, FRAME> {
         Self {
             payload_type,
             frame_ticks,
+            red_payload_type: None,
+            red_wait: 0,
             ssrc: None,
             last_sr: None,
             stats: SourceStats::new(),
@@ -72,17 +86,51 @@ impl<const SLOTS: usize, const FRAME: usize> Receiver<SLOTS, FRAME> {
         }
     }
 
+    /// Also take redundant packets (RFC 2198) of `payload_type`, whose
+    /// primary frames are of the receiver's own payload type, and recover
+    /// lost frames from their redundant blocks. Plain packets are still
+    /// taken, so a peer that doesn't send redundancy works as before.
+    ///
+    /// A lost frame is only recovered if the packet carrying it arrives
+    /// before the frame's turn to play, so while redundant packets arrive
+    /// the target depth is raised by `wait` frames: 1 for redundancy depth
+    /// 1, 2 for depth 2 and so on, at that many frame periods of latency.
+    /// With `wait` at 0, only frames whose next packet happens to be in
+    /// time are recovered. `max_depth` limits the total.
+    #[must_use]
+    pub const fn with_redundancy(mut self, payload_type: u8, wait: u8) -> Self {
+        self.red_payload_type = Some(payload_type);
+        self.red_wait = wait;
+        self
+    }
+
     /// Take a packet. `arrival` is the local receive time in RTP clock ticks,
     /// from any origin; only differences matter.
     ///
     /// Packets from a source still on probation (RFC 3550 A.1) are buffered
     /// anyway: they have already passed the version, payload type and size
     /// checks, and dropping the start of every stream would be audible.
+    ///
+    /// For a redundant packet, the result is the primary frame's. A
+    /// redundant block is used if its frame is missing, still due to play,
+    /// and its offset is `k` whole frames, `k` at most `SLOTS`: it is then
+    /// taken to be frame `sequence - k`. That holds as long as the sender,
+    /// like [`red::Encoder`], never carries a frame across a silence.
     pub fn receive(&mut self, packet: &Packet<'_>, arrival: u32) -> Received {
         let header = packet.header;
-        if header.payload_type != self.payload_type {
+        let (primary, redundant) = if Some(header.payload_type) == self.red_payload_type {
+            let Ok(red) = red::Payload::parse(packet.payload) else {
+                return Received::Malformed;
+            };
+            if red.payload_type != self.payload_type {
+                return Received::WrongPayloadType;
+            }
+            (red.primary, Some(red))
+        } else if header.payload_type == self.payload_type {
+            (packet.payload, None)
+        } else {
             return Received::WrongPayloadType;
-        }
+        };
         if self.ssrc != Some(header.ssrc) {
             self.ssrc = Some(header.ssrc);
             self.stats = SourceStats::new();
@@ -98,13 +146,55 @@ impl<const SLOTS: usize, const FRAME: usize> Receiver<SLOTS, FRAME> {
             SeqStatus::Valid | SeqStatus::Probation => {}
         }
         self.stats.record_arrival(header.timestamp, arrival);
+        let wait = if redundant.is_some() {
+            self.red_wait
+        } else {
+            0
+        };
         if self.warmup < WARMUP_PACKETS {
             self.warmup += 1;
+            if wait > 0 {
+                let initial = self.buffer.config().initial_depth;
+                self.buffer.set_target(initial.saturating_add(wait));
+            }
         } else {
             self.buffer
                 .set_target_from_jitter(self.stats.jitter(), self.frame_ticks);
+            if wait > 0 {
+                self.buffer
+                    .set_target(self.buffer.target().saturating_add(wait));
+            }
         }
-        self.buffer.push(header.sequence, packet.payload).into()
+        let received = self.buffer.push(header.sequence, primary).into();
+        if let Some(red) = redundant {
+            for block in red.blocks() {
+                if block.payload_type != self.payload_type {
+                    continue;
+                }
+                if let Some(back) = self.frames_in(block.timestamp_offset) {
+                    self.buffer
+                        .recover(header.sequence.wrapping_sub(back), block.data);
+                }
+            }
+        }
+        received
+    }
+
+    /// `ticks` as a whole number of frames, from 1 to `SLOTS`; anything
+    /// else can't be placed in the buffer. Counts up rather than dividing,
+    /// for the Cortex-M0+.
+    fn frames_in(&self, ticks: u16) -> Option<u16> {
+        let ticks = u32::from(ticks);
+        if self.frame_ticks == 0 {
+            return None;
+        }
+        let mut frames = 0u16;
+        let mut covered = 0u32;
+        while covered < ticks && usize::from(frames) < SLOTS {
+            covered += self.frame_ticks;
+            frames += 1;
+        }
+        (frames > 0 && covered == ticks).then_some(frames)
     }
 
     /// The next frame period's output. Call exactly once per frame period.

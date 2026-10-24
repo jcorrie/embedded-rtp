@@ -121,6 +121,10 @@ pub struct Counters {
     pub oversized: u32,
     /// Times playout ran dry and went back to prefilling.
     pub underruns: u32,
+    /// Frames buffered by [`JitterBuffer::recover`], from redundancy, that
+    /// had not arrived on their own. They are counted in `played` too when
+    /// they play.
+    pub recovered: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +218,7 @@ impl<const SLOTS: usize, const FRAME: usize> JitterBuffer<SLOTS, FRAME> {
                 duplicate: 0,
                 oversized: 0,
                 underruns: 0,
+                recovered: 0,
             },
         }
     }
@@ -272,8 +277,32 @@ impl<const SLOTS: usize, const FRAME: usize> JitterBuffer<SLOTS, FRAME> {
 
     /// Buffer a frame.
     pub fn push(&mut self, sequence: u16, payload: &[u8]) -> Push {
+        let push = self.insert(sequence, payload);
+        match push {
+            Push::Accepted => {}
+            Push::Late => self.counters.late += 1,
+            Push::Duplicate => self.counters.duplicate += 1,
+            Push::Oversized => self.counters.oversized += 1,
+        }
+        push
+    }
+
+    /// Buffer a copy of a frame that came as redundancy in a later packet
+    /// (see [`red`](crate::red)), if it is still missing and its turn has
+    /// not passed. It is placed exactly as [`push`](Self::push) would place
+    /// it, but most copies arrive after the frame itself, so `Late` and
+    /// `Duplicate` are expected and not counted. An accepted frame is
+    /// counted as `recovered`.
+    pub fn recover(&mut self, sequence: u16, payload: &[u8]) -> Push {
+        let push = self.insert(sequence, payload);
+        if push == Push::Accepted {
+            self.counters.recovered += 1;
+        }
+        push
+    }
+
+    fn insert(&mut self, sequence: u16, payload: &[u8]) -> Push {
         if payload.len() > FRAME {
-            self.counters.oversized += 1;
             return Push::Oversized;
         }
         let max_depth = usize::from(self.config.max_depth);
@@ -288,7 +317,6 @@ impl<const SLOTS: usize, const FRAME: usize> JitterBuffer<SLOTS, FRAME> {
                 .floor
                 .is_some_and(|floor| (sequence.wrapping_sub(floor) as i16) < 0);
             if behind_floor {
-                self.counters.late += 1;
                 return Push::Late;
             }
             let back = self.next.wrapping_sub(sequence) as i16;
@@ -299,7 +327,6 @@ impl<const SLOTS: usize, const FRAME: usize> JitterBuffer<SLOTS, FRAME> {
 
         let offset = sequence.wrapping_sub(self.next) as i16;
         if offset < 0 {
-            self.counters.late += 1;
             return Push::Late;
         }
 
@@ -329,7 +356,6 @@ impl<const SLOTS: usize, const FRAME: usize> JitterBuffer<SLOTS, FRAME> {
         }
 
         if self.holds(sequence) {
-            self.counters.duplicate += 1;
             return Push::Duplicate;
         }
         let slot = self.slot_mut(sequence);

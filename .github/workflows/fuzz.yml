@@ -1,6 +1,6 @@
-# Fuzz the RTP and RTCP readers (fuzz/). A minute each on pull requests
-# that touch them; longer every week. Kept out of ci.yml so its apt cache
-# key doesn't change with this file.
+# Fuzz the RTP, RTCP and redundant (RFC 2198) payload readers (fuzz/). A
+# minute each on pull requests that touch them; longer every week. Kept out
+# of ci.yml so its apt cache key doesn't change with this file.
 name: fuzz
 
 on:
@@ -10,6 +10,7 @@ on:
       - src/lib.rs
       - src/packet.rs
       - src/rtcp.rs
+      - src/red.rs
       - fuzz/**
       - .github/workflows/fuzz.yml
   schedule:
@@ -23,7 +24,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [rtp_packet, rtcp_compound]
+        target: [rtp_packet, rtcp_compound, red_payload]
     env:
       SECONDS_EACH: ${{ github.event_name == 'pull_request' && 60 || 1200 }}
     steps:

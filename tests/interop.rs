@@ -759,6 +759,186 @@ fn ffmpeg_stream_plays_through_receiver_unchanged() {
     assert_eq!(played, input);
 }
 
+/// The `red` payload type for the RFC 2198 tests.
+const RED_PAYLOAD_TYPE: u8 = 97;
+
+/// GStreamer packetizes known audio and adds redundancy (RFC 2198) with
+/// `rtpredenc`, carrying the frame `distance` packets back. Every tenth
+/// packet is dropped; we must recover each lost frame exactly from a later
+/// packet, so the audio plays through unchanged.
+#[test]
+#[ignore = "needs GStreamer (gst-launch-1.0 with the rtp plugin)"]
+fn gstreamer_redundancy_recovers_every_lost_frame() {
+    let input = test_signal(CLOCK_RATE as usize, 0);
+    for distance in [1u16, 2] {
+        let dir = scratch(&format!("gst-redenc-{distance}"));
+        let input_path = dir.join("in.raw");
+        fs::write(&input_path, l16_bytes(&input)).unwrap();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let gst = spawn(
+            "gst-launch-1.0",
+            &[
+                "-q",
+                "filesrc",
+                &format!("location={}", input_path.to_str().unwrap()),
+                "!",
+                "rawaudioparse",
+                "format=pcm",
+                "pcm-format=s16be",
+                "sample-rate=16000",
+                "num-channels=1",
+                "!",
+                "rtpL16pay",
+                "pt=96",
+                "min-ptime=20000000",
+                "max-ptime=20000000",
+                "!",
+                "rtpredenc",
+                &format!("pt={RED_PAYLOAD_TYPE}"),
+                &format!("distance={distance}"),
+                "!",
+                "udpsink",
+                "host=127.0.0.1",
+                &format!("port={port}"),
+                "sync=false",
+            ],
+        );
+        let frames = input.len() / FRAME_SAMPLES;
+        let mut datagrams = Vec::new();
+        let mut buf = [0u8; 2048];
+        while datagrams.len() < frames {
+            let (len, _) = socket
+                .recv_from(&mut buf)
+                .expect("GStreamer stopped sending early");
+            datagrams.push(buf[..len].to_vec());
+        }
+        drop(gst);
+
+        let config = Config {
+            initial_depth: 2,
+            min_depth: 1,
+            max_depth: 16,
+        };
+        let mut receiver: Receiver<16, 1500> =
+            Receiver::new(PAYLOAD_TYPE, FRAME_SAMPLES as u32, config)
+                .with_redundancy(RED_PAYLOAD_TYPE, distance as u8);
+        let mut played = Vec::new();
+        let mut take = |receiver: &mut Receiver<16, 1500>| match receiver.play() {
+            Playout::Frame { payload, .. } => {
+                played.extend(l16_samples(payload));
+                true
+            }
+            Playout::Lost { sequence } => panic!("distance {distance}: {sequence} not recovered"),
+            Playout::Silence => false,
+        };
+        let mut dropped = 0;
+        for (i, datagram) in datagrams.iter().enumerate() {
+            let packet = Packet::parse(datagram).unwrap();
+            assert_eq!(packet.header.payload_type, RED_PAYLOAD_TYPE);
+            if i % 10 == 5 {
+                dropped += 1;
+            } else {
+                let arrival = (i * FRAME_SAMPLES) as u32;
+                assert_eq!(
+                    receiver.receive(&packet, arrival),
+                    embedded_rtp::Received::Accepted
+                );
+            }
+            take(&mut receiver);
+        }
+        // The last packets' frames, and their redundant copies, are still
+        // to come: the final frame can only be recovered if a packet after
+        // it arrives, so none of the last `distance` is dropped.
+        while take(&mut receiver) {}
+        assert_eq!(receiver.counters().recovered, dropped);
+        assert_eq!(played, input, "distance {distance}");
+    }
+}
+
+/// Our redundant packets (RFC 2198) decode in GStreamer's `rtpreddec`.
+/// Isolated packets are dropped; GStreamer must recover each lost frame
+/// from the next packet's redundant block and play the audio unchanged.
+#[test]
+#[ignore = "needs GStreamer (gst-launch-1.0 with the rtp plugin)"]
+fn gstreamer_recovers_from_our_redundancy() {
+    use embedded_rtp::packet::HEADER_LEN;
+    use embedded_rtp::red::Encoder;
+
+    const FRAMES: usize = 100;
+    const FRAME_BYTES: usize = FRAME_SAMPLES * 2;
+    let dropped = [10, 31, 52, 77];
+    let dir = scratch("gst-reddec");
+    let port = free_port_pair();
+    let output_path = dir.join("out.raw");
+    let caps = format!(
+        "application/x-rtp,media=audio,clock-rate=16000,encoding-name=L16,channels=1,payload={PAYLOAD_TYPE}"
+    );
+    let gst = spawn(
+        "gst-launch-1.0",
+        &[
+            "-q",
+            "-e",
+            "udpsrc",
+            &format!("port={port}"),
+            &format!("caps={caps}"),
+            "!",
+            "rtpreddec",
+            &format!("pt={RED_PAYLOAD_TYPE}"),
+            "!",
+            "rtpjitterbuffer",
+            "latency=200",
+            "!",
+            "rtpL16depay",
+            "!",
+            "filesink",
+            &format!("location={}", output_path.to_str().unwrap()),
+        ],
+    );
+    wait_until_bound(port);
+
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut sender = Sender::new(
+        0x5eed_cafe,
+        RED_PAYLOAD_TYPE,
+        FRAME_SAMPLES as u32,
+        65_500,
+        u32::MAX - 20 * FRAME_SAMPLES as u32,
+    );
+    let mut encoder: Encoder<1, FRAME_BYTES> = Encoder::new(PAYLOAD_TYPE, FRAME_SAMPLES as u32);
+    let frames: Vec<Vec<i16>> = (0..FRAMES)
+        .map(|i| test_signal(FRAME_SAMPLES, i * FRAME_SAMPLES))
+        .collect();
+    let mut buf = [0u8; HEADER_LEN + Encoder::<1, FRAME_BYTES>::MAX_PAYLOAD];
+    for (i, frame) in frames.iter().enumerate() {
+        let len = encoder
+            .encode(
+                sender.timestamp(),
+                &l16_bytes(frame),
+                &mut buf[HEADER_LEN..],
+            )
+            .unwrap();
+        let len = sender.send_in_place(&mut buf, len).unwrap();
+        if !dropped.contains(&i) {
+            socket.send_to(&buf[..len], ("127.0.0.1", port)).unwrap();
+        }
+        sleep(Duration::from_millis(5));
+    }
+    sleep(Duration::from_millis(500));
+    gst.interrupt();
+
+    let decoded = l16_samples(&fs::read(&output_path).unwrap());
+    let expected: Vec<i16> = frames.concat();
+    assert_eq!(decoded.len(), expected.len(), "frame count");
+    assert!(
+        decoded == expected,
+        "decoded audio differs from what was sent"
+    );
+}
+
 /// SRTP (RFC 3711) against ffmpeg's implementation, in both directions, with
 /// the default suite and one master key for RTP and RTCP as SDES sets up.
 /// Both streams start just below the sequence number wrap, so the rollover

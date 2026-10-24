@@ -106,6 +106,7 @@ embedded-rtp
 ├── receiver   stats + jitter buffer + SSRC handling
 ├── sender     sequence/timestamp/marker bookkeeping
 ├── l16        PCM16 encode/decode, simple loss concealment
+├── red        RFC 2198 redundant audio: payload format, encoder
 └── srtp       SRTP/SRTCP and key wrap (optional `srtp` feature)
 ```
 
@@ -307,6 +308,83 @@ For the intercom, these RTCP messages replace ad-hoc control traffic:
     phase, no sample step exceeds the bound the design implies, and naive
     concealment demonstrably breaks that bound.
 
+### `red`
+
+Redundant audio (RFC 2198, #11). Wi-Fi tends to lose single packets or
+short bursts; with each packet also carrying the frame or frames before it,
+an isolated loss is recovered exactly from the next packet instead of being
+concealed.
+
+```rust
+pub struct Block<'a> { payload_type: u8, timestamp_offset: u16, data: &'a [u8] }
+pub struct Payload<'a> { payload_type: u8, primary: &'a [u8], /* headers, block data */ }
+impl<'a> Payload<'a> {
+    pub fn parse(payload: &'a [u8]) -> Result<Self, Error>;   // Truncated if headers or lengths overrun
+    pub fn blocks(&self) -> impl Iterator<Item = Block<'a>> + 'a;
+}
+pub fn write(blocks: &[Block], payload_type: u8, primary: &[u8], out: &mut [u8]) -> Result<usize, Error>;
+
+pub struct Encoder<const DEPTH: usize, const FRAME: usize> { /* the last DEPTH frames sent */ }
+impl Encoder {
+    pub const MAX_PAYLOAD: usize;                     // DEPTH * (4 + FRAME) + 1 + FRAME
+    pub const fn new(payload_type: u8, frame_ticks: u32) -> Self;
+    pub fn encode(&mut self, timestamp: u32, primary: &[u8], out: &mut [u8]) -> Result<usize, Error>;
+    pub fn reset(&mut self);
+}
+
+impl Receiver {
+    pub const fn with_redundancy(self, payload_type: u8, wait: u8) -> Self;
+}
+impl JitterBuffer {
+    pub fn recover(&mut self, sequence: u16, payload: &[u8]) -> Push;   // counts `recovered`, not late/duplicate
+}
+```
+
+How it works:
+
+- **Negotiated per stream.** Redundant packets have their own dynamic
+  payload type (`a=rtpmap:97 red/16000/1`, `a=fmtp:97 96/96`). A receiver
+  set up `with_redundancy` takes both, so a peer without redundancy works
+  unchanged; one that isn't sees an unknown payload type.
+- **Sending.** `Encoder::encode` writes the block headers, the earlier
+  frames (oldest first) and the primary into the packet buffer after the
+  RTP header; `Sender::send_in_place` adds the header. The encoder keeps a
+  ring of the last `DEPTH` frames, about `DEPTH × FRAME` bytes.
+- **Placing blocks.** RFC 2198 blocks carry a timestamp offset, not a
+  sequence number, and the jitter buffer is keyed by sequence number. A
+  block whose offset is exactly `k` frames is placed as frame
+  `sequence - k`. That is right only if no frame period between them went
+  unsent: across a silence, sequence numbers stay contiguous while
+  timestamps jump. So the encoder carries the frame sent `k` packets ago
+  only if it is also exactly `k` frames ago on the media clock, and never
+  carries anything across a silence. Offsets that aren't a whole number of frames, or are more than
+  `SLOTS` frames, and blocks of another payload type, are ignored.
+- **Recovery.** The primary is pushed first, then each block through
+  `recover`, which places a frame exactly as `push` would, including
+  pulling the play point back while prefilling, so the first frame of a
+  talkspurt can be recovered from the second packet. Most copies arrive
+  after their frame, so `Late` and `Duplicate` are expected there and not
+  counted; an accepted copy counts as `recovered`. The RFC 3550 statistics
+  still see the loss: they count packets, not frames.
+- **Latency.** A frame can only be recovered if the next packet arrives
+  before the frame's turn to play. While redundant packets arrive, the
+  receiver adds `wait` frames to the jitter target (1 for depth 1): the
+  next packet arrives one frame period after the lost one would have, with
+  the same jitter. `max_depth` still caps the total.
+- **Bandwidth.** Depth 1 doubles the payload: 1,297-byte packets, about
+  520 kbit/s each way for the intercom profile instead of 260. Depth 2
+  triples it and recovers bursts of two. G.722 (#12) would bring depth 1
+  back to about a quarter of that.
+- **CPU.** Encoding copies the frame twice (into the packet and into the
+  ring); receiving looks up each block's slot. About 10,000 ARMv6-M
+  instructions a frame both ends together. With SRTP, the larger packet
+  roughly doubles the SRTP cost, which dominates on a Cortex-M0+ (see
+  [On a Cortex-M0+](#on-a-cortex-m0)).
+- Tested: with 5% independent loss, depth 1 cuts the frames lost to the
+  listener by about 95%, leaving losses whose next packet was lost too. With
+  bursts of two, depth 2 recovers about 97%, all but bursts that run into
+  each other.
+
 ### `srtp`
 
 SRTP and SRTCP (RFC 3711) with the default suite, `AES_CM_128_HMAC_SHA1_80`,
@@ -373,14 +451,16 @@ slightly smaller.
 
 | Item | Bytes |
 |---|---|
-| `Receiver<16, 640>` (server) | 10,472 |
-| `Receiver<8, 640>` (Pico) | 5,304 |
+| `Receiver<16, 640>` (server) | 10,488 |
+| `Receiver<8, 640>` (Pico) | 5,320 |
 | `Concealer<320>` | 1,292 |
 | `JitterBuffer<16, 640>` | 10,400 |
 | `JitterBuffer<8, 640>` | 5,232 |
 | `SourceStats` | 40 |
 | `Sender` | 24 |
 | Packet buffer | 652 (12 + 640), 662 with SRTP |
+| `red::Encoder<1, 640>` | 664 |
+| Packet buffer with redundancy, depth 1 | 1,297 (12 + 4 + 1 + 2 × 640), 1,307 with SRTP |
 | `srtp::Outbound` | 1,760 (1,040 on the RP2040) |
 | `srtp::Inbound` | 3,536 (2,080 on the RP2040) |
 
@@ -472,6 +552,9 @@ instructions.
 | SRTP tag check only (a forged packet) | 29,000 |
 | Whole device frame, both directions, SRTP | 279,480 |
 | New SRTP context (key derivation) | 80,320 |
+| Redundancy, depth 1: encode with the frame before | 7,680 |
+| Redundancy, depth 1: parse, receive, play | 4,040 |
+| SRTP protect, 1,297 bytes (redundancy, depth 1) | 281,400 |
 
 A Cortex-M0+ takes one cycle for most instructions and two for loads,
 stores and taken branches, so cycles are roughly 1.3 to 1.6 times these
@@ -481,6 +564,13 @@ instructions. CI fails if the whole frame passes 400,000 instructions.
 `examples/pico-w`'s `cycles` binary runs the same workload on a board and
 reports real cycles, including flash cache misses. Those numbers still
 need recording here.
+
+Redundancy itself adds about 10,000 instructions a frame. With SRTP on,
+its cost is the bigger packet: protecting and unprotecting 1,297 bytes
+instead of 652 adds about 280,000 instructions a frame, doubling the whole
+frame to about 560,000, or 29 to 36% of the CPU. That is over the CI
+budget, which covers the default device without redundancy; a device that
+wants both should consider the cost, or G.722 (#12) to shrink the frames.
 
 ### Latency budget
 
@@ -630,14 +720,46 @@ because a misreading shared by both halves would pass. See issue #1.
   sequence numbers, padding not removed, too narrow an RTCP range, the
   misorder limit off by one, duplicates not counted, the wrong jitter gain, no
   24-bit clamp, the wrong fraction scaling.
+- **Redundancy** (`tests/rfc2198_red.rs`, #11):
+  - payloads assembled from the RFC 2198 §3 diagram with plain integer
+    arithmetic, every field at its extremes and two blocks deep, and 20,000
+    random ones; the parser must report exactly what went in and the
+    writer must produce the same bytes. Corrupted and cut payloads either
+    fail to parse or write back byte for byte;
+  - the encoder carries the frames before, oldest first, never across a
+    silence, and keeps each frame's own length; a failed encode changes
+    nothing;
+  - the receiver recovers an isolated loss bit-exactly, a burst of two at
+    depth 2 (only its second frame at depth 1), and the first frame of a
+    talkspurt; copies of frames it already has are not counted as late or
+    duplicate; malformed payloads, foreign primaries and blocks it can't
+    place are dropped; the wait raises the target;
+  - a simulated network with delay spread, independent loss, bursts and
+    silences, checking every frame played is the right one, in order: depth
+    1 cuts the frames lost to the listener by over 90% at 5% loss, and
+    depth 2 recovers bursts of two that depth 1 can't.
+
+  Interop:
+  - GStreamer's `rtpredenc`, at distance 1 and 2, with every tenth packet
+    dropped: we recover every lost frame and play the audio unchanged;
+  - our redundant stream, with isolated packets dropped, decodes in
+    GStreamer's `rtpreddec` to the exact audio.
+
+  Eleven bugs in the redundancy code were caught: two in the block
+  header bit layout, the parser's length check, the encoder's ring index,
+  block order and silence check (a real bug in the first draft), the
+  receiver's whole-frame check, its sequence mapping, block payload type
+  filter and wait, and counting copies as late (only after a test for
+  copies arriving after their frame played was added).
 - **Embedded build.** CI runs `cargo build --target thumbv6m-none-eabi`.
-- **Fuzzing (#6).** `cargo fuzz` targets in `fuzz/` for `Packet::parse`
-  and `rtcp::Compound::parse`: neither may panic or hand out a slice outside
+- **Fuzzing (#6).** `cargo fuzz` targets in `fuzz/` for `Packet::parse`,
+  `rtcp::Compound::parse` and `red::Payload::parse`: none may panic or hand out a slice outside
   its input. A parsed RTP header, written back bare, must keep the input's
   V, M, PT, sequence, timestamp and SSRC. Every SR, RR, SDES and BYE
   accepted, written again with `Writer`, must parse to the same contents;
   other packet types (APP, feedback) are only checked for bounds, as
-  `Writer` can't write them. CI runs each for a minute on pull requests
+  `Writer` can't write them. Every redundant payload accepted must write
+  back with `red::write` to the input, byte for byte. CI runs each for a minute on pull requests
   that touch the readers, and for 20 minutes weekly. The first runs found
   one bug: a BYE with a zero reason length followed by non-zero bytes was
   accepted, its "padding" never checked.
@@ -654,6 +776,8 @@ because a misreading shared by both halves would pass. See issue #1.
    measurements (#5). **Built**: `examples/pico-w`, with instruction counts
    from QEMU. Still to do on hardware: a first run, and real cycle counts
    from its `cycles` binary.
+6. Redundant audio, RFC 2198 (#11). **Done**: `red`, interoperating with
+   GStreamer.
 
 Further work, by priority:
 
@@ -661,7 +785,6 @@ Further work, by priority:
 |---|---|---|
 | #9 | Echo handling for full duplex | High for full duplex |
 | #10 | Clock drift by samples, not frames | Medium |
-| #11 | Redundant audio (RFC 2198) | Medium |
 | #12 | G.722 codec | Low until bandwidth matters |
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |
@@ -676,4 +799,5 @@ Further work, by priority:
 | Codec | Raw 16-bit PCM (L16) only. The payload stays opaque, so a codec can be added later without API changes. |
 | Licence | Dual MIT OR Apache-2.0. |
 | Distribution | Git dependency; not published to crates.io. |
+| Redundancy | RFC 2198 on its own payload type, opt-in per stream. Blocks are placed by sequence number, `k` frames of offset being `k` packets back, so the encoder never carries frames across a silence. |
 | Security | SRTP with `AES_CM_128_HMAC_SHA1_80`, optional feature. Fresh session keys from the application; the crate never invents or exchanges keys. |

@@ -18,8 +18,9 @@ use std::hint::black_box;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use embedded_rtp::jitter::{Config, JitterBuffer, Playout};
 use embedded_rtp::l16::{self, Concealer};
-use embedded_rtp::packet::{self, Header, Packet};
+use embedded_rtp::packet::{self, Header, Packet, HEADER_LEN};
 use embedded_rtp::profile::{FRAME_BYTES, FRAME_SAMPLES, PACKET_BYTES, PAYLOAD_TYPE};
+use embedded_rtp::red::{Encoder, Payload};
 use embedded_rtp::rtcp::{self, Compound, ReportBlock, SenderInfo, Writer};
 use embedded_rtp::stats::SourceStats;
 use embedded_rtp::{Receiver, Sender};
@@ -231,6 +232,61 @@ fn rtcp_reports(c: &mut Criterion) {
     group.finish();
 }
 
+const RED_PAYLOAD_TYPE: u8 = 97;
+type RedEncoder = Encoder<1, FRAME_BYTES>;
+const RED_PACKET_BYTES: usize = HEADER_LEN + RedEncoder::MAX_PAYLOAD;
+
+/// Redundancy (RFC 2198) at depth 1: what it adds to each frame, both ends.
+fn redundancy(c: &mut Criterion) {
+    let mut group = c.benchmark_group("red");
+    let payload = [0x5a; FRAME_BYTES];
+    let mut encoder = RedEncoder::new(PAYLOAD_TYPE, TICKS);
+    let mut out = [0u8; RedEncoder::MAX_PAYLOAD];
+    let mut timestamp = 0u32;
+    group.bench_function("encode", |b| {
+        b.iter(|| {
+            timestamp = timestamp.wrapping_add(TICKS);
+            encoder
+                .encode(timestamp, black_box(&payload), &mut out)
+                .unwrap()
+        })
+    });
+    group.bench_function("parse", |b| {
+        b.iter(|| {
+            let payload = Payload::parse(black_box(&out)).unwrap();
+            payload.blocks().count() + payload.primary.len()
+        })
+    });
+    group.finish();
+
+    let mut group = c.benchmark_group("frame");
+    group.throughput(Throughput::Bytes(FRAME_BYTES as u64));
+    // As frame/send_receive_play, every packet carrying the frame before.
+    let mut sender = Sender::new(1, RED_PAYLOAD_TYPE, TICKS, 0, 0);
+    let mut encoder = RedEncoder::new(PAYLOAD_TYPE, TICKS);
+    let mut receiver = Receiver::<16, FRAME_BYTES>::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT)
+        .with_redundancy(RED_PAYLOAD_TYPE, 1);
+    let mut wire = [0u8; RED_PACKET_BYTES];
+    let mut i = 0u32;
+    group.bench_function("red_send_receive_play", |b| {
+        b.iter(|| {
+            let len = encoder
+                .encode(
+                    sender.timestamp(),
+                    black_box(&payload),
+                    &mut wire[HEADER_LEN..],
+                )
+                .unwrap();
+            let len = sender.send_in_place(&mut wire, len).unwrap();
+            let packet = Packet::parse(&wire[..len]).unwrap();
+            i = i.wrapping_add(1);
+            receiver.receive(&packet, i * TICKS);
+            black_box(receiver.play());
+        })
+    });
+    group.finish();
+}
+
 fn jitter_buffers(c: &mut Criterion) {
     jitter::<8>(c, 2);
     jitter::<16>(c, 2);
@@ -317,6 +373,7 @@ criterion_group!(
     concealment,
     rtcp_reports,
     jitter_buffers,
-    frame
+    frame,
+    redundancy
 );
 criterion_main!(benches);
