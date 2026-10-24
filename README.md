@@ -69,6 +69,7 @@ intercom: Pico W devices talking to a server over UDP.
 | [`l16`](src/l16.rs) | Big-endian PCM16 encode/decode (RFC 3551 §4.5.11) and `Concealer`, which turns playout into samples and fades over lost frames without clicks. |
 | [`duck`](src/duck.rs) | An echo suppressor for full-duplex devices: `Ducker` turns the microphone down while the speaker plays, with attack, hold and release times. |
 | [`red`](src/red.rs) | Redundant audio (RFC 2198): each packet also carries the frame or frames before it, so a lost frame is recovered exactly from the next packet. |
+| [`drift`](src/drift.rs) | `DriftCorrector`, after the concealer: follows the sender's clock by dropping or repeating single samples at the flattest point of a frame, instead of the jitter buffer dropping whole frames or running dry. |
 | [`srtp`](src/srtp.rs) | SRTP and SRTCP (RFC 3711), `AES_CM_128_HMAC_SHA1_80`, in place on the packet buffer, with replay protection and seamless rekeying. AES key wrap (RFC 5649) to deliver session keys without TLS. Behind the `srtp` feature. |
 | [`profile`](src/profile.rs) | Constants for an intercom format: L16, 16 kHz mono, 20 ms frames, payload type 96. Nothing else depends on them. |
 
@@ -89,7 +90,9 @@ Done:
 - a Pico W intercom device, built in CI, with per-frame costs counted on
   ARMv6-M under QEMU (#5). It still needs trying on hardware;
 - an echo suppressor for full duplex, about 43 instructions a sample on a
-  Cortex-M0+ (#9).
+  Cortex-M0+ (#9);
+- clock drift corrected a sample at a time, instead of by whole frames
+  (#10).
 
 Not supported (yet):
 
@@ -105,9 +108,7 @@ Not supported (yet):
   than in a phone call. An adaptive echo canceller is a possible later step
   ([#9](https://github.com/jcorrie/embedded-rtp/issues/9)).
 - Frames must all have the same duration
-  ([#13](https://github.com/jcorrie/embedded-rtp/issues/13)), and clock drift
-  is corrected by whole frames, not samples
-  ([#10](https://github.com/jcorrie/embedded-rtp/issues/10)).
+  ([#13](https://github.com/jcorrie/embedded-rtp/issues/13)).
 - Out of scope: ICE, DTLS, SDP negotiation, RTCP feedback (NACK, PLI and so
   on), floating-point codecs such as Opus, and multiple streams per
   `Receiver` (keep one `Receiver` per remote stream).
@@ -495,8 +496,11 @@ payload type 96, RTP and RTCP on one UDP port.
    echo the other end would hear; then `l16::encode` it into the packet
    buffer and carry on as above. (Push-to-talk devices, which mute the
    speaker while sending, don't need it.)
-2. Play `concealer.play(receiver.play())`. `None` means silence; keep the
-   output clock running either way.
+2. Play `corrector.play(&mut receiver, &mut concealer)`, or plain
+   `concealer.play(receiver.play())` without the `DriftCorrector`. `None`
+   means silence; keep the output clock running either way. The corrector
+   follows the sender's clock a sample at a time, so the two crystals'
+   drift never costs a dropped frame or a gap.
 
 **Device, on each datagram:**
 
@@ -879,7 +883,9 @@ pass:
   floating-point evaluation of the RFC formula, within a proven bound. The
   jitter buffer runs with drifting clocks, delay spread, stalls and silence
   suppression, and every decision it makes is checked against what really
-  arrived.
+  arrived. The drift corrector runs for a simulated hour at up to 200 ppm:
+  no drains or underruns, and its net correction matches the clocks' real
+  difference.
 - **Interop.** ffmpeg's packets parse to the exact audio it was given (also
   checked from a captured fixture in the default run); ffmpeg decodes our
   streams, with silences and wraparound, back to the exact audio; GStreamer's
@@ -927,7 +933,6 @@ From the [milestones](docs/design.md#milestones) in the design document:
 
 | Issue | | Priority |
 |---|---|---|
-| [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
 | [#12](https://github.com/jcorrie/embedded-rtp/issues/12) | G.722 codec | Low until bandwidth matters |
 | [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
 | [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |

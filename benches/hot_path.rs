@@ -16,6 +16,7 @@
 use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use embedded_rtp::drift::DriftCorrector;
 use embedded_rtp::duck::{self, Ducker};
 use embedded_rtp::jitter::{Config, JitterBuffer, Playout};
 use embedded_rtp::l16::{self, Concealer};
@@ -354,6 +355,25 @@ fn frame(c: &mut Criterion) {
             let packet = Packet::parse(black_box(&bytes)).unwrap();
             receiver.receive(&packet, i * TICKS);
             concealer.play(receiver.play()).map(|s| s[0])
+        })
+    });
+
+    // As above, through the drift corrector. With no clock skew this is the
+    // path with no correction, a copy of each frame; a correction adds a
+    // scan of the frame for where to make it, a few times a second at most.
+    let mut receiver = Receiver::<16, FRAME_BYTES>::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT);
+    let mut concealer = Concealer::<FRAME_SAMPLES>::new();
+    let mut corrector = DriftCorrector::<FRAME_SAMPLES>::new();
+    let mut bytes = intercom_packet(0);
+    let mut i = 0u32;
+    group.bench_function("receive_play_samples_drift_corrected", |b| {
+        b.iter(|| {
+            i = i.wrapping_add(1);
+            bytes[2..4].copy_from_slice(&(i as u16).to_be_bytes());
+            bytes[4..8].copy_from_slice(&(i * TICKS).to_be_bytes());
+            let packet = Packet::parse(black_box(&bytes)).unwrap();
+            receiver.receive(&packet, i * TICKS);
+            corrector.play(&mut receiver, &mut concealer).map(|s| s[0])
         })
     });
 

@@ -92,7 +92,8 @@ Once out of scope, now done or planned:
   (#8, done);
 - end-to-end key agreement for direct calls (#15);
 - integer codecs, G.722 (#12);
-- sample-level clock-drift correction instead of dropping whole frames (#10);
+- sample-level clock-drift correction instead of dropping whole frames
+  (#10, done);
 - RFC 8285 header extensions, for talker levels (#14).
 
 ## Modules
@@ -108,6 +109,7 @@ embedded-rtp
 ├── l16        PCM16 encode/decode, simple loss concealment
 ├── duck       echo suppressor: microphone down while the speaker plays
 ├── red        RFC 2198 redundant audio: payload format, encoder
+├── drift      clock drift correction by single samples, after l16
 └── srtp       SRTP/SRTCP and key wrap (optional `srtp` feature)
 ```
 
@@ -344,6 +346,62 @@ to the server it is new audio.
   floating-point reference, within 0.1 dB); attack, hold and release times
   measured from the output; no overflow at any extreme; block size makes no
   difference.
+
+### `drift`
+
+Clock drift correction a sample at a time (#10). Two crystals within
+±50 ppm can differ by 100 ppm, so without correction a slow receiver's
+buffer grows until the jitter buffer drains a frame, and a fast one's runs
+dry: at 100 ppm, a click or gap every three or four minutes.
+
+- `DriftCorrector<N>::play(&mut receiver, &mut concealer)` replaces
+  `concealer.play(receiver.play())`. It hands out N samples a period but
+  pulls 0, 1 or 2 frames: one sample over (dropped) or under (repeated)
+  carries into the next period, and every N corrections one frame period
+  pulls an extra frame or none.
+- **Measuring.** While the buffer plays, each period: the audio waiting
+  (depth × N plus the samples left over) less the setpoint, averaged over
+  128 periods (an EMA, Q8) so jitter doesn't register as drift.
+- **Setpoint: target + 1.5 frames.** Depth is only known to a whole frame,
+  since when within a period the next packet arrives isn't, and leftover
+  samples don't guard against running dry, only buffered frames do. At
+  target + 1.5 the buffer settles at target + 1 frames before each pop
+  with about half a frame left over: a frame clear of running dry even as an
+  arrival slips, and clear of draining (above target + `DRAIN_MARGIN`).
+  Playout latency is then about the target plus 1.5 frames: half a frame to
+  a frame more than the buffer alone, which sits at its target to a frame
+  over. Within 1.5 frames of `max_depth` the setpoint stops rising, so it
+  never pushes the buffer into overflowing, and it never goes below the
+  target itself (with `target = max_depth = 1`, there is no headroom to
+  correct into).
+- **Correcting.** The averaged error, beyond a dead band of an eighth of a
+  frame, is accumulated; each time the total passes `GAIN_FRAMES` (1,024)
+  times one sample, one sample is dropped or repeated. A standing error of
+  `e` samples beyond the dead band makes `e / 1024` corrections a period:
+  200 ppm needs one every 16 periods, from about 100 samples of error. The
+  loop's time constant (1,024 periods) is 8 times the averaging's, so it
+  doesn't overshoot, and the dead band stops it dithering when there is no
+  drift.
+- **Where.** A dropped sample is the one whose neighbours are closest; a
+  repeated one, the one closest to its successor. That is the flattest point
+  of the frame (a peak, or silence): the smallest step the frame allows.
+  On a sine that is far below the waveform's steepest step; a frame with no
+  flat point at all (a steady ramp) still gets a step of two of its own.
+- The jitter buffer's own drain and prefill stay as the fallback for large
+  excursions (Wi-Fi stalls, jitter beyond `max_depth`).
+- Cost: about 3,100 ARMv6-M instructions a frame (two frame copies), plus a
+  scan of the frame for each correction, a few a second at most.
+- Tested by simulation (`tests/drift.rs`): an hour at ±30, 100 and 200 ppm
+  with 25 ms of jitter makes no drains, underruns or overflows, keeps the
+  averaged error within a frame, and makes a net correction equal to the
+  clocks' real difference with few the wrong way; the same runs uncorrected
+  drain or underrun. A ramp shows every sample out once and in order apart
+  from the counted corrections; sines from 100 Hz to 3 kHz show no step over
+  the signal's own steepest; with no drift corrections stop and audio passes
+  through bit for bit; jitter alone hardly corrects; silences between
+  talkspurts don't wind the loop up; and from no jitter to jitter that
+  fills the buffer, it never adds glitches over the jitter buffer alone.
+  Nine bugs planted by hand were all caught.
 
 ### `red`
 
@@ -585,6 +643,7 @@ instructions.
 | Parse, receive, play | 1,160 |
 | Concealment: good frame / lost frame then good | 2,440 / 7,480 |
 | Echo suppressor (`duck`), full duplex only | 13,600 |
+| Parse, receive and play through `DriftCorrector` (vs parse, receive, play and decode without) | 6,760 (vs 3,640) |
 | SRTP protect, 652 bytes | 137,080 |
 | SRTP unprotect, 662 bytes | 137,440 |
 | SRTP tag check only (a forged packet) | 29,000 |
@@ -821,7 +880,6 @@ Further work, by priority:
 
 | Issue | | Priority |
 |---|---|---|
-| #10 | Clock drift by samples, not frames | Medium |
 | #12 | G.722 codec | Low until bandwidth matters |
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |

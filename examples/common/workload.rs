@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use embedded_rtp::drift::DriftCorrector;
 use embedded_rtp::duck::{self, Ducker};
 use embedded_rtp::jitter::{Config, Playout};
 use embedded_rtp::l16::{self, Concealer};
@@ -34,6 +35,13 @@ pub struct Workload {
     receiver: Receiver<8, FRAME_BYTES>,
     concealer: Concealer<FRAME_SAMPLES>,
     ducker: Ducker,
+    /// For the drift corrector: a receiver and concealer of its own.
+    drift_receiver: Receiver<8, FRAME_BYTES>,
+    drift_concealer: Concealer<FRAME_SAMPLES>,
+    corrector: DriftCorrector<FRAME_SAMPLES>,
+    /// Plain packets for it, made before timing so only receiving and
+    /// playing are counted.
+    drift_packets: [[u8; PACKET_BYTES]; RUNS as usize],
     packet: [u8; SRTP_BYTES],
     /// Fresh SRTP packets: replays are rejected, so each run needs its own.
     protected: [[u8; SRTP_BYTES]; RUNS as usize],
@@ -66,6 +74,14 @@ impl Workload {
         // Packets to unprotect, as another sender would make them.
         let mut sender = Sender::new(7, PAYLOAD_TYPE, TICKS, 100, 0);
         let mut outbound = Outbound::new(&key(1));
+        // Plain packets for the drift corrector, from a sender of its own.
+        let mut drift_sender = Sender::new(9, PAYLOAD_TYPE, TICKS, 0, 0);
+        let mut drift_packets = [[0u8; PACKET_BYTES]; RUNS as usize];
+        for p in &mut drift_packets {
+            p.copy_from_slice(&packet[..PACKET_BYTES]);
+            drift_sender.send_in_place(p, FRAME_BYTES).unwrap();
+        }
+
         let mut protected = [[0u8; SRTP_BYTES]; RUNS as usize];
         for p in &mut protected {
             p.copy_from_slice(&packet);
@@ -98,6 +114,10 @@ impl Workload {
             receiver: Receiver::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT),
             concealer: Concealer::new(),
             ducker: Ducker::new(duck::Config::DEFAULT),
+            drift_receiver: Receiver::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT),
+            drift_concealer: Concealer::new(),
+            corrector: DriftCorrector::new(),
+            drift_packets,
             packet,
             protected,
             device,
@@ -236,6 +256,23 @@ impl Workload {
             let mut mic = frame;
             ducker.process(&loud, &mut mic);
             core::hint::black_box(mic);
+        });
+
+        // Plain packets into a receiver, then play through the corrector:
+        // against "parse + receive + play" plus "concealer: good frame"
+        // above, the difference is what drift correction costs a frame
+        // when it isn't correcting.
+        let drift_receiver = &mut self.drift_receiver;
+        let drift_concealer = &mut self.drift_concealer;
+        let corrector = &mut self.corrector;
+        let drift_packets = &self.drift_packets;
+        let mut drift_arrival = 0u32;
+        time("parse + receive + play through drift corrector", &mut |i| {
+            if let Ok(p) = Packet::parse(&drift_packets[i as usize]) {
+                drift_arrival = drift_arrival.wrapping_add(TICKS);
+                drift_receiver.receive(&p, drift_arrival);
+            }
+            let _ = corrector.play(drift_receiver, drift_concealer);
         });
 
         let device = &mut self.device;
