@@ -375,3 +375,35 @@ fn silences_between_talkspurts_do_not_wind_the_loop_up() {
         );
     }
 }
+
+#[test]
+fn no_headroom_means_no_corrections() {
+    // A buffer held at exactly one frame (min = initial = max = 1) leaves
+    // nothing to correct into: with no drift it must neither drop samples
+    // nor run dry.
+    let config = Config {
+        initial_depth: 1,
+        min_depth: 1,
+        max_depth: 1,
+    };
+    let mut sender = Sender::new(1, PT, N as u32, 0, 0);
+    let mut receiver = Receiver::<16, BYTES>::new(PT, N as u32, config);
+    let mut concealer = Concealer::<N>::new();
+    let mut corrector = DriftCorrector::<N>::new();
+    let samples: Vec<i16> = (0..N as u64).map(tone).collect();
+    let mut payload = [0u8; BYTES];
+    l16::encode(&samples, &mut payload);
+    for tick in 0..10_000u32 {
+        let mut buf = [0u8; 12 + BYTES];
+        let len = sender.send(&payload, &mut buf).unwrap();
+        receiver.receive(&Packet::parse(&buf[..len]).unwrap(), tick * N as u32);
+        corrector.play(&mut receiver, &mut concealer);
+    }
+    assert_eq!(receiver.counters().underruns, 0);
+    let corrections = corrector.corrections();
+    assert_eq!(
+        corrections.dropped + corrections.repeated,
+        0,
+        "{corrections:?}"
+    );
+}

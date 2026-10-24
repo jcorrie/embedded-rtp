@@ -367,9 +367,13 @@ dry: at 100 ppm, a click or gap every three or four minutes.
   samples don't guard against running dry, only buffered frames do. At
   target + 1.5 the buffer settles at target + 1 frames before each pop
   with about half a frame left over: a frame clear of running dry even as an
-  arrival slips, and clear of draining (above target + `DRAIN_MARGIN`). It
-  costs about half a frame of latency. Within 1.5 frames of `max_depth` the
-  setpoint stops rising, so it never pushes the buffer into overflowing.
+  arrival slips, and clear of draining (above target + `DRAIN_MARGIN`).
+  Playout latency is then about the target plus 1.5 frames: half a frame to
+  a frame more than the buffer alone, which sits at its target to a frame
+  over. Within 1.5 frames of `max_depth` the setpoint stops rising, so it
+  never pushes the buffer into overflowing, and it never goes below the
+  target itself (with `target = max_depth = 1`, there is no headroom to
+  correct into).
 - **Correcting.** The averaged error, beyond a dead band of an eighth of a
   frame, is accumulated; each time the total passes `GAIN_FRAMES` (1,024)
   times one sample, one sample is dropped or repeated. A standing error of
@@ -380,11 +384,12 @@ dry: at 100 ppm, a click or gap every three or four minutes.
   drift.
 - **Where.** A dropped sample is the one whose neighbours are closest; a
   repeated one, the one closest to its successor. That is the flattest point
-  of the frame (a peak, or silence), and the step left is never larger than
-  the signal's own steepest.
+  of the frame (a peak, or silence): the smallest step the frame allows.
+  On a sine that is far below the waveform's steepest step; a frame with no
+  flat point at all (a steady ramp) still gets a step of two of its own.
 - The jitter buffer's own drain and prefill stay as the fallback for large
   excursions (Wi-Fi stalls, jitter beyond `max_depth`).
-- Cost: about 2,100 ARMv6-M instructions a frame (the frame copy), plus a
+- Cost: about 3,100 ARMv6-M instructions a frame (two frame copies), plus a
   scan of the frame for each correction, a few a second at most.
 - Tested by simulation (`tests/drift.rs`): an hour at ±30, 100 and 200 ppm
   with 25 ms of jitter makes no drains, underruns or overflows, keeps the
@@ -638,7 +643,7 @@ instructions.
 | Parse, receive, play | 1,160 |
 | Concealment: good frame / lost frame then good | 2,440 / 7,480 |
 | Echo suppressor (`duck`), full duplex only | 13,600 |
-| Send, receive and play through `DriftCorrector` (vs about 4,700 without) | 6,800 |
+| Parse, receive and play through `DriftCorrector` (vs parse, receive, play and decode without) | 6,760 (vs 3,640) |
 | SRTP protect, 652 bytes | 137,080 |
 | SRTP unprotect, 662 bytes | 137,440 |
 | SRTP tag check only (a forged packet) | 29,000 |

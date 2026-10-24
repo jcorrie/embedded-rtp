@@ -358,8 +358,9 @@ fn frame(c: &mut Criterion) {
         })
     });
 
-    // As above, through the drift corrector: what it adds is a copy of
-    // each frame (and, now and then, a scan for where to correct).
+    // As above, through the drift corrector. With no clock skew this is the
+    // path with no correction, a copy of each frame; a correction adds a
+    // scan of the frame for where to make it, a few times a second at most.
     let mut receiver = Receiver::<16, FRAME_BYTES>::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT);
     let mut concealer = Concealer::<FRAME_SAMPLES>::new();
     let mut corrector = DriftCorrector::<FRAME_SAMPLES>::new();

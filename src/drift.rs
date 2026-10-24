@@ -30,9 +30,10 @@
 //! - **Measuring.** While the jitter buffer is playing, each frame period
 //!   the audio waiting to be heard (the buffer's depth plus the samples
 //!   left over from the last frame pulled) is compared with the buffer's
-//!   target plus one and a half frames, which adds about half a frame of
-//!   latency over the buffer alone but keeps it a frame clear of running
-//!   dry. The difference is averaged over about
+//!   target plus one and a half frames, so playout latency is about the
+//!   target plus 1.5 frames: half a frame to a frame more than the buffer
+//!   alone, which sits at its target to a frame over, but a frame clear of
+//!   running dry. The difference is averaged over about
 //!   [`AVERAGE_FRAMES`] periods, so network jitter doesn't register as
 //!   drift.
 //! - **Correcting.** The average is accumulated; each time the total passes
@@ -44,16 +45,18 @@
 //!   no drift the corrections stop.
 //! - **Where.** A dropped sample is the one whose neighbours are closest,
 //!   a repeated one the one closest to its successor: the flattest point in
-//!   the frame, often a waveform's peak or a stretch of silence. The step
-//!   that results is never larger than the signal's own steepest step.
+//!   the frame, often a waveform's peak or a stretch of silence. It picks
+//!   the smallest step the frame allows; on a sine that is far smaller than
+//!   the waveform's own steepest step, though a frame with no flat point
+//!   (a steady ramp) still gets a step of two of its own.
 //! - **Fallback.** The jitter buffer still drains whole frames and prefills
 //!   after running dry, for large excursions such as Wi-Fi stalls; the
 //!   corrector only keeps drift from causing them.
 //!
-//! Integer arithmetic only. A frame with no correction costs one copy; a
+//! Integer arithmetic only. A frame with no correction costs two copies; a
 //! correction adds one scan of the frame.
 
-use crate::l16::Concealer;
+use crate::l16::{Concealer, FADE};
 use crate::Receiver;
 
 /// Frame periods the depth error is averaged over, as a power of two.
@@ -120,11 +123,14 @@ impl<const N: usize> DriftCorrector<N> {
     ///
     /// # Panics
     ///
-    /// If `N` is under 4 samples; in a `const` or `static` that is a
-    /// compile error.
+    /// If `N` is outside what [`Concealer`] takes ([`FADE`]..=32768
+    /// samples); in a `const` or `static` that is a compile error.
     #[must_use]
     pub const fn new() -> Self {
-        assert!(N >= 4, "a frame must be at least 4 samples");
+        assert!(
+            N >= FADE && N <= 32_768,
+            "frame must be FADE..=32768 samples, as for Concealer"
+        );
         Self {
             frame: [0; N],
             used: N,
@@ -202,10 +208,15 @@ impl<const N: usize> DriftCorrector<N> {
         // even as an arrival slips, and clear of draining (above target +
         // DRAIN_MARGIN).
         // Near the ceiling, the margin would only make the buffer overflow:
-        // stay 1.5 frames under `max_depth` and leave the rest to it.
+        // stay 1.5 frames under `max_depth` and leave the rest to it. Never
+        // below the target itself, though: with no headroom at all (target
+        // = max_depth = 1) a setpoint of zero would drop samples, and run
+        // the buffer dry, with no drift at all.
+        let target = usize::from(buffer.target()) * N;
         let ceiling = usize::from(buffer.config().max_depth) * N;
-        let setpoint = (usize::from(buffer.target()) * N + 3 * N / 2)
-            .min(ceiling.saturating_sub(3 * N / 2)) as i64;
+        let setpoint = (target + 3 * N / 2)
+            .min(ceiling.saturating_sub(3 * N / 2))
+            .max(target) as i64;
         let error = (waiting - setpoint) << Q;
         self.average += (error - self.average) >> AVERAGE_SHIFT;
         let dead_band = ((N * DEAD_BAND_EIGHTHS / 8) as i64) << Q;
