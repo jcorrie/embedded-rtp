@@ -16,6 +16,7 @@
 //! - [`rtcp`]: sender and receiver reports, source descriptions and
 //!   goodbyes (RFC 3550 §6).
 //! - [`l16`]: the L16 payload format and packet loss concealment.
+//! - [`g722`]: the G.722 codec, 16 kHz audio in a quarter of L16's bandwidth.
 //! - [`duck`]: an echo suppressor for full-duplex devices: the microphone
 //!   is turned down while the speaker plays.
 //! - [`red`]: redundant audio (RFC 2198), to recover lost frames exactly.
@@ -30,6 +31,7 @@
 #![warn(missing_docs)]
 
 pub mod duck;
+pub mod g722;
 pub mod jitter;
 pub mod l16;
 pub mod packet;

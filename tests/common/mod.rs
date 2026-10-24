@@ -112,3 +112,51 @@ pub fn split_fixture(mut bytes: &[u8]) -> Vec<&[u8]> {
     }
     packets
 }
+
+/// One second of 16 kHz audio for the G.722 tests, made with integer
+/// arithmetic only so it is the same everywhere: the full-range
+/// `test_signal`, a loud triangle wave, quiet noise over a square wave,
+/// then silence into a loud square wave. Between them they drive both
+/// bands' quantizers and predictors hard.
+///
+/// It stays just short of where the QMF's outputs would need limiting to
+/// 15 bits, which ffmpeg's encoder leaves out (`g722_full_scale_input` goes
+/// there).
+pub fn g722_test_input() -> Vec<i16> {
+    let mut out = test_signal(4000, 0);
+    out.extend((0..4000).map(|i: i32| {
+        let phase = i % 74;
+        let ramp = if phase < 37 { phase } else { 74 - phase };
+        (ramp * 1100 - 20_000) as i16
+    }));
+    let mut rng = Rng::new(722);
+    out.extend((0..4000).map(|i| {
+        let square = if (i / 20) % 2 == 0 { 1500 } else { -1500 };
+        square + (rng.below(4001) as i32 - 2000) as i16
+    }));
+    out.extend((0..4000).map(|i| match i {
+        0..=999 => 0,
+        _ if (i / 50) % 2 == 0 => 24_000,
+        _ => -24_000,
+    }));
+    out
+}
+
+/// Half a second of full-scale square waves and noise, to drive the G.722
+/// encoder's QMF outputs past 15 bits, where the reference limits them.
+pub fn g722_full_scale_input() -> Vec<i16> {
+    let mut rng = Rng::new(7220);
+    (0..8000)
+        .map(|i| match i {
+            0..=1999 if (i / 50) % 2 == 0 => i16::MAX,
+            0..=1999 => i16::MIN,
+            2000..=3999 if (i / 7) % 2 == 0 => i16::MAX,
+            2000..=3999 => i16::MIN,
+            _ => rng.next_u32() as i16,
+        })
+        .collect()
+}
+
+/// `tests/fixtures/ffmpeg-g722.bin`: ffmpeg's G.722 codes for
+/// `g722_test_input`, then ffmpeg's decoding of them as big-endian samples.
+pub const G722_FIXTURE_CODES: usize = 8000;

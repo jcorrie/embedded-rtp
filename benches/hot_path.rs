@@ -17,6 +17,7 @@ use std::hint::black_box;
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use embedded_rtp::duck::{self, Ducker};
+use embedded_rtp::g722;
 use embedded_rtp::jitter::{Config, JitterBuffer, Playout};
 use embedded_rtp::l16::{self, Concealer};
 use embedded_rtp::packet::{self, Header, Packet, HEADER_LEN};
@@ -150,6 +151,25 @@ fn jitter<const SLOTS: usize>(c: &mut Criterion, depth: u8) {
             })
         },
     );
+    group.finish();
+}
+
+/// G.722, one 20 ms frame: 320 samples to 160 bytes and back.
+fn g722_codec(c: &mut Criterion) {
+    let mut group = c.benchmark_group("g722");
+    group.throughput(Throughput::Bytes(FRAME_BYTES as u64));
+    let samples: [i16; FRAME_SAMPLES] =
+        core::array::from_fn(|i| ((i as i32 * 97) % 8_000 - 4_000) as i16);
+    let mut encoder = g722::Encoder::new();
+    let mut codes = [0u8; FRAME_SAMPLES / 2];
+    group.bench_function("encode", |b| {
+        b.iter(|| encoder.encode(black_box(&samples), &mut codes))
+    });
+    let mut decoder = g722::Decoder::new();
+    let mut out = [0i16; FRAME_SAMPLES];
+    group.bench_function("decode", |b| {
+        b.iter(|| decoder.decode(black_box(&codes), &mut out))
+    });
     group.finish();
 }
 
@@ -381,6 +401,7 @@ criterion_group!(
     stats,
     sender,
     concealment,
+    g722_codec,
     rtcp_reports,
     jitter_buffers,
     frame,

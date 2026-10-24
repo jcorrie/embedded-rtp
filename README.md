@@ -14,7 +14,8 @@ packets, it includes the parts that make audio actually play: the RFC 3550
 statistics (sequence validation, loss, interarrival jitter), an adaptive
 reordering jitter buffer, click-free loss concealment for L16 audio, RTCP
 reports with round-trip times, redundancy to recover lost frames exactly,
-and optional SRTP to authenticate and encrypt it all.
+the G.722 codec for a quarter of the bandwidth, and optional SRTP to
+authenticate and encrypt it all.
 
 Other Rust RTP crates either need `std`, need an allocator, or leave the
 jitter buffer to you (see [why a new crate](docs/design.md#why-a-new-crate)).
@@ -32,6 +33,7 @@ intercom: Pico W devices talking to a server over UDP.
 - [RTCP](#rtcp)
 - [SRTP](#srtp)
 - [Redundancy](#redundancy)
+- [G.722](#g722)
 - [Building an intercom](#building-an-intercom)
 - [Example: std::net::UdpSocket](#example-stdnetudpsocket)
 - [Pico W](#pico-w)
@@ -67,6 +69,7 @@ intercom: Pico W devices talking to a server over UDP.
 | [`Receiver`](src/receiver.rs) / [`Sender`](src/sender.rs) | The above wired together for one incoming and one outgoing stream. This is what most code uses. |
 | [`rtcp`](src/rtcp.rs) | RTCP (RFC 3550 §6): read and write compound packets with SR, RR, SDES and BYE, validated per appendix A.2. Round-trip times from report blocks. |
 | [`l16`](src/l16.rs) | Big-endian PCM16 encode/decode (RFC 3551 §4.5.11) and `Concealer`, which turns playout into samples and fades over lost frames without clicks. |
+| [`g722`](src/g722.rs) | The G.722 codec: 16 kHz audio in 64 kbit/s, a quarter of L16. Integer sub-band ADPCM, bit-exact with the ITU-T reference. |
 | [`duck`](src/duck.rs) | An echo suppressor for full-duplex devices: `Ducker` turns the microphone down while the speaker plays, with attack, hold and release times. |
 | [`red`](src/red.rs) | Redundant audio (RFC 2198): each packet also carries the frame or frames before it, so a lost frame is recovered exactly from the next packet. |
 | [`srtp`](src/srtp.rs) | SRTP and SRTCP (RFC 3711), `AES_CM_128_HMAC_SHA1_80`, in place on the packet buffer, with replay protection and seamless rekeying. AES key wrap (RFC 5649) to deliver session keys without TLS. Behind the `srtp` feature. |
@@ -89,7 +92,9 @@ Done:
 - a Pico W intercom device, built in CI, with per-frame costs counted on
   ARMv6-M under QEMU (#5). It still needs trying on hardware;
 - an echo suppressor for full duplex, about 43 instructions a sample on a
-  Cortex-M0+ (#9).
+  Cortex-M0+ (#9);
+- the G.722 codec, bit-exact with the ITU-T reference and interoperating
+  with ffmpeg (#12).
 
 Not supported (yet):
 
@@ -97,9 +102,8 @@ Not supported (yet):
   up to the application (see [SRTP](#srtp)). End-to-end key agreement for
   direct calls is planned
   ([#15](https://github.com/jcorrie/embedded-rtp/issues/15)).
-- **L16 only** for decoding and concealment. The payload is opaque to
-  `Receiver` and `Sender`, so you can carry other formats, but G.722 support
-  is still to come ([#12](https://github.com/jcorrie/embedded-rtp/issues/12)).
+- **L16 and G.722 only** as codecs. The payload is opaque to `Receiver`
+  and `Sender`, so you can carry other formats with your own codec.
 - **Echo suppression, not cancellation.** `duck` turns the microphone
   down while the speaker plays, so talking over each other works less well
   than in a phone call. An adaptive echo canceller is a possible later step
@@ -477,6 +481,71 @@ frames for which that is true, so never across a silence. With a sender
 that does carry frames across a silence, a recovered frame could land in
 the wrong place.
 
+## G.722
+
+G.722 (ITU-T) carries the same 16 kHz audio as L16 in 64 kbit/s instead of
+256: 160 bytes a frame instead of 640. It's integer sub-band ADPCM from the
+1980s, so it needs no FPU, and ffmpeg, GStreamer and most SIP phones speak
+it. `profile::Codec` switches the intercom format to it:
+
+```rust
+use embedded_rtp::g722::{Decoder, Encoder};
+use embedded_rtp::jitter::Config;
+use embedded_rtp::l16::Concealer;
+use embedded_rtp::packet::{Packet, HEADER_LEN};
+use embedded_rtp::profile::{Codec, FRAME_SAMPLES};
+use embedded_rtp::{Receiver, Sender};
+
+let codec = Codec::G722;
+// Payload type 9, and 160 ticks a frame: G.722's RTP clock runs at 8 kHz
+// although it samples at 16 (RFC 3551).
+let ticks = codec.frame_ticks();
+let mut sender = Sender::new(0x1234_5678, codec.payload_type(), ticks, 0, 0);
+let mut receiver: Receiver<8, 160> = Receiver::new(codec.payload_type(), ticks, Config::DEFAULT);
+let (mut encoder, mut decoder) = (Encoder::new(), Decoder::new());
+let mut concealer = Concealer::<FRAME_SAMPLES>::new();
+
+let captured = [0i16; FRAME_SAMPLES];
+let mut buf = [0u8; HEADER_LEN + 160];
+let len = encoder.encode(&captured, &mut buf[HEADER_LEN..]);
+let len = sender.send_in_place(&mut buf, len)?;
+receiver.receive(&Packet::parse(&buf[..len])?, 0);
+
+// Every 20 ms: decode, or conceal a lost frame in samples.
+let samples = concealer.play_decoded(receiver.play(), |payload, out| {
+    decoder.decode(payload, out)
+});
+# let _ = samples;
+# Ok::<(), embedded_rtp::Error>(())
+```
+
+- **Quality.** Below 4 kHz the lower band gets 6 bits a sample: 36 to
+  over 60 dB of signal to noise on sine waves. From 4 to 8 kHz the higher
+  band gets 2, about 20 to 26 dB. The codec delays the audio by 22 samples
+  (1.4 ms).
+- **State.** Encoder and decoder each keep about 400 bytes of state from
+  frame to frame, so each stream needs its own, fed every frame in order.
+  A lost frame is concealed in samples (`Concealer::play_decoded`) and the
+  decoder carries on with the next: having missed a frame, it has adapted
+  differently from the encoder, and takes about 100 ms to come within 30 dB
+  and a few hundred to match again. [Redundancy](#redundancy) brings lost
+  frames back exactly, so the decoder never drifts, and at depth 1 a G.722
+  packet is still only 337 bytes.
+- **CPU.** About 150,000 ARMv6-M instructions a frame to encode and
+  143,000 to decode, 15 to 19% of a 125 MHz Cortex-M0+ both ways. SRTP gets
+  cheaper on the smaller packets, so a whole device frame with SRTP comes to
+  about 375,000 instructions instead of 280,000 for L16. On a server, about
+  14 µs to encode a frame and 10 µs to decode.
+- **Modes.** `Decoder::with_mode` can also decode at 56 or 48 kbit/s, using
+  5 or 4 of the lower band's 6 bits; RTP always uses 64.
+
+Every code and sample is bit-exact with the ITU-T reference implementation
+(G.191's software tool library), on its test data and on harder signals.
+ffmpeg's G.722 matches it too, except at two extremes: its encoder doesn't
+limit the filter bank's outputs to 15 bits on near full-scale input, and
+both its encoder and decoder saturate one running sum once rather than at
+every step. There, this crate follows the reference.
+
 ## Building an intercom
 
 The crate was written for an intercom: devices and a server, each device
@@ -526,8 +595,9 @@ key per device: see [SRTP](#srtp).
 about 3 KB for SRTP. 16 slots on the server.
 
 **Lossy Wi-Fi.** [Redundancy](#redundancy) recovers lost frames exactly,
-for twice the bandwidth and a frame more latency. The example server and
-devices don't use it yet.
+for twice the bandwidth and a frame more latency. [G.722](#g722) cuts the
+bandwidth to a quarter for more CPU. The example server and devices use
+neither yet.
 
 All of this, runnable: a mixing server and a desktop client, with SRTP and
 a join handshake that delivers fresh keys. See
@@ -779,6 +849,15 @@ a=rtpmap:96 L16/16000/1
 a=ptime:20
 ```
 
+With [G.722](#g722), on its static payload type, and with the 8 kHz clock
+rate RFC 3551 gives it:
+
+```text
+m=audio 5004 RTP/AVP 9
+a=rtpmap:9 G722/8000
+a=ptime:20
+```
+
 For example, to listen to a stream sent to port 5004, save a complete SDP
 file (adding `v=0`, `o=`, `s=`, `c=IN IP4 127.0.0.1` and `t=0 0` lines) as
 `stream.sdp` and run:
@@ -801,6 +880,7 @@ slightly smaller.
 | `Sender` | 24 |
 | Packet buffer | 652 (662 with SRTP) |
 | `red::Encoder<1, 640>` | 664 (one frame); packet buffer 1,297 |
+| `g722::Encoder` / `g722::Decoder` | 400 / 408; packet buffer 172 |
 | `srtp::Outbound` | 1,760 (1,040 on the RP2040) |
 | `srtp::Inbound` | 3,536 (2,080 on the RP2040; half holds the old key during a rekey) |
 
@@ -827,6 +907,7 @@ the optimizations behind them and the latency budget.
 | SRTP: reject a forged frame | ~0.55 µs |
 | One frame, one direction, with SRTP | ~1.3 µs |
 | Redundancy, depth 1: encode / parse | ~35 ns / ~16 ns |
+| G.722: encode / decode a frame | ~14 µs / ~10 µs |
 
 The hot path makes one payload copy (into the jitter buffer) and no division,
 which matters on the Cortex-M0+: it has no divide instruction. Processing is
@@ -873,6 +954,14 @@ pass:
   simulated lossy network that knows which frames were lost, depth 1
   recovers over 90% of independent losses and depth 2 recovers bursts of
   two, with every frame played checked to be the right one.
+- **G.722.** Bit-exact with the ITU-T reference implementation: its own
+  test data in all three modes, and the reference run on full-scale signals
+  and adversarial codes (these need the reference; see
+  [docs/design.md#testing](docs/design.md#testing)). In the default run,
+  bit-exact with ffmpeg's encoder and decoder from a captured fixture. The
+  embedded modes, codec delay, quality across the band and recovery after a
+  lost frame are checked too, and so is decoding through `Sender`,
+  `Receiver` and the concealer.
 - **Simulations with ground truth.** A simulated network drops, duplicates
   and reorders packets across several sequence number wraps; expected loss
   figures come from what it actually delivered. Jitter is checked against a
@@ -886,6 +975,8 @@ pass:
   RTCP receiver reports about our stream agree with our statistics.
   With redundancy, GStreamer's `rtpreddec` recovers frames lost from our
   stream, and we recover every frame lost from its `rtpredenc` stream.
+  ffmpeg sends and receives G.722 over RTP with us, decoding to exactly the
+  same audio.
 - **RTCP.** Packets are checked byte for byte against vectors written from
   the RFC 3550 §6.4–§6.6 diagrams, and each appendix A.2 validity rule is
   tested on its own. The round-trip arithmetic is checked against the RFC's
@@ -911,13 +1002,22 @@ pass:
 
 ```sh
 cargo test --all-features                                               # everything except interop
-cargo test --all-features --test interop -- --ignored --test-threads=1  # needs ffmpeg and GStreamer
+cargo test --all-features --test interop -- --ignored --test-threads=1 \
+    --skip itu_reference                                                # needs ffmpeg and GStreamer
+cargo test --test interop -- --ignored itu_reference                   # needs the G.722 reference, below
 cargo build --release --target thumbv6m-none-eabi        # the embedded build
 cd fuzz && cargo +nightly fuzz run rtcp_compound          # or rtp_packet, red_payload; needs cargo-fuzz
 ```
 
 The interop tests are Unix only. On Debian or Ubuntu they need
 `ffmpeg gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good`.
+
+The G.722 reference tests need the ITU-T reference implementation, from
+[G.191's software tool library](https://github.com/openitu/STL). It has its
+own licence, so it isn't part of this repository or run in CI. Build its
+`g722demo` (`cmake -S STL -B build && cmake --build build --target
+g722demo`), then set `G722_REFERENCE` to the binary and `G722_TEST_DATA` to
+`STL/src/g722/test_data`.
 The code blocks in this README are compiled as doctests. See
 [docs/design.md#testing](docs/design.md#testing) for the full list.
 
@@ -928,7 +1028,6 @@ From the [milestones](docs/design.md#milestones) in the design document:
 | Issue | | Priority |
 |---|---|---|
 | [#10](https://github.com/jcorrie/embedded-rtp/issues/10) | Clock drift by samples, not frames | Medium |
-| [#12](https://github.com/jcorrie/embedded-rtp/issues/12) | G.722 codec | Low until bandwidth matters |
 | [#13](https://github.com/jcorrie/embedded-rtp/issues/13) | Packets of varying duration | Low |
 | [#14](https://github.com/jcorrie/embedded-rtp/issues/14) | Talker information (CSRC, levels) | Low |
 | [#15](https://github.com/jcorrie/embedded-rtp/issues/15) | End-to-end key agreement for direct calls | Low until needed |
@@ -948,8 +1047,11 @@ cargo fmt --check
 RUSTFLAGS="-D warnings" cargo clippy --all-targets               # and with --all-features
 cargo test                                                       # and with --all-features, on stable and 1.81 (MSRV)
 cargo build --release --target thumbv6m-none-eabi --all-features  # no std, no allocator
-cargo test --all-features --test interop -- --ignored --test-threads=1
+cargo test --all-features --test interop -- --ignored --test-threads=1 --skip itu_reference
 ```
+
+A change to `src/g722.rs` should also pass the G.722 reference tests (see
+[Testing and conformance](#testing-and-conformance)).
 
 Keep the library free of dependencies (optional, audited ones aside),
 allocation, floating point and `unsafe`, and keep constructors `const` (SRTP

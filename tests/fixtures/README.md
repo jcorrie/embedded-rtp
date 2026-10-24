@@ -34,3 +34,17 @@ Same length-prefixed format. To regenerate (needs ffmpeg):
 ```sh
 UPDATE_FIXTURES=1 cargo test --test interop ffmpeg_rtcp -- --ignored
 ```
+
+## `ffmpeg-g722.bin`
+
+ffmpeg's G.722 encoding (6.1.1, `-c:a g722`) of `common::g722_test_input`:
+8000 code bytes, then ffmpeg's decoding of those codes as 16,000 big-endian
+samples. ffmpeg's encoder and decoder are bit-exact with the ITU-T reference
+on this input; they depart from it only at extremes the input avoids (see
+`itu_reference_g722_on_hard_signals` in `tests/interop.rs`).
+
+To regenerate (needs ffmpeg; the file only changes if ffmpeg does):
+
+```sh
+UPDATE_FIXTURES=1 cargo test --test interop ffmpeg_g722 -- --ignored
+```

@@ -123,8 +123,32 @@ impl<const N: usize> Concealer<N> {
     /// concealed. [`Playout::Silence`] fades out what was playing, then is
     /// silent.
     pub fn play(&mut self, playout: Playout<'_>) -> Option<&[i16; N]> {
+        self.play_decoded(playout, decode)
+    }
+
+    /// Like [`play`](Self::play), for payloads in another format such as
+    /// [G.722](crate::g722): `decode` turns a frame's payload into samples
+    /// and returns how many it wrote. It is only called for a
+    /// [`Playout::Frame`].
+    ///
+    /// ```
+    /// # use embedded_rtp::{g722, jitter::Config, l16::Concealer, Receiver};
+    /// let mut receiver = Receiver::<16, 160>::new(g722::PAYLOAD_TYPE, 160, Config::DEFAULT);
+    /// let mut decoder = g722::Decoder::new();
+    /// let mut concealer = Concealer::<320>::new();
+    /// // Every 20 ms:
+    /// let samples = concealer.play_decoded(receiver.play(), |payload, out| {
+    ///     decoder.decode(payload, out)
+    /// });
+    /// # let _ = samples;
+    /// ```
+    pub fn play_decoded(
+        &mut self,
+        playout: Playout<'_>,
+        decode: impl FnOnce(&[u8], &mut [i16]) -> usize,
+    ) -> Option<&[i16; N]> {
         match playout {
-            Playout::Frame { payload, .. } => Some(self.good(payload)),
+            Playout::Frame { payload, .. } => Some(self.good(payload, decode)),
             Playout::Lost { .. } => {
                 self.losses += 1;
                 let target = if self.losses == 1 { HALF } else { 0 };
@@ -137,8 +161,12 @@ impl<const N: usize> Concealer<N> {
         }
     }
 
-    fn good(&mut self, payload: &[u8]) -> &[i16; N] {
-        let written = decode(payload, &mut self.frame);
+    fn good(
+        &mut self,
+        payload: &[u8],
+        decode: impl FnOnce(&[u8], &mut [i16]) -> usize,
+    ) -> &[i16; N] {
+        let written = decode(payload, &mut self.frame).min(N);
         if written < N {
             self.frame[written..].fill(0);
         }

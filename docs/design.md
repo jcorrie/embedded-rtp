@@ -91,7 +91,7 @@ Once out of scope, now done or planned:
 - SRTP and SRTCP behind an optional feature using audited RustCrypto crates
   (#8, done);
 - end-to-end key agreement for direct calls (#15);
-- integer codecs, G.722 (#12);
+- integer codecs: G.722 (#12, done);
 - sample-level clock-drift correction instead of dropping whole frames (#10);
 - RFC 8285 header extensions, for talker levels (#14).
 
@@ -108,6 +108,7 @@ embedded-rtp
 ├── l16        PCM16 encode/decode, simple loss concealment
 ├── duck       echo suppressor: microphone down while the speaker plays
 ├── red        RFC 2198 redundant audio: payload format, encoder
+├── g722       G.722 codec: 16 kHz audio in 64 kbit/s
 └── srtp       SRTP/SRTCP and key wrap (optional `srtp` feature)
 ```
 
@@ -410,8 +411,8 @@ How it works:
   the same jitter. `max_depth` still caps the total.
 - **Bandwidth.** Depth 1 doubles the payload: 1,297-byte packets, about
   520 kbit/s each way for the intercom profile instead of 260. Depth 2
-  triples it and recovers bursts of two. G.722 (#12) would bring depth 1
-  back to about a quarter of that.
+  triples it and recovers bursts of two. With G.722 (#12), depth 1 is
+  337-byte packets, about a quarter of that.
 - **CPU.** Encoding copies the frame twice (into the packet and into the
   ring); receiving looks up each block's slot. About 10,000 ARMv6-M
   instructions a frame both ends together. With SRTP, the larger packet
@@ -421,6 +422,84 @@ How it works:
   listener by about 95%, leaving losses whose next packet was lost too. With
   bursts of two, depth 2 recovers about 97%, all but bursts that run into
   each other.
+
+### `g722`
+
+The G.722 codec (ITU-T, 1988; #12): 16 kHz audio in 64 kbit/s, a quarter of
+L16, so a quarter of the bandwidth and Wi-Fi airtime.
+
+```rust
+pub const PAYLOAD_TYPE: u8 = 9;       // static (RFC 3551)
+pub const CLOCK_RATE: u32 = 8_000;    // RTP clock, though it samples at 16 kHz
+pub enum Mode { Kbps64, Kbps56, Kbps48 }
+
+pub struct Encoder { /* QMF history, two bands' predictor state */ }
+impl Encoder {
+    pub const fn new() -> Self;
+    pub fn encode(&mut self, samples: &[i16], out: &mut [u8]) -> usize;   // a byte per two samples
+}
+pub struct Decoder { /* the same, plus the mode */ }
+impl Decoder {
+    pub const fn new() -> Self;
+    pub const fn with_mode(mode: Mode) -> Self;
+    pub fn decode(&mut self, codes: &[u8], out: &mut [i16]) -> usize;     // two samples per byte
+    pub fn set_mode(&mut self, mode: Mode);
+}
+
+impl Concealer { pub fn play_decoded(&mut self, playout: Playout, decode: impl FnOnce(&[u8], &mut [i16]) -> usize) -> Option<&[i16; N]>; }
+impl profile::Codec { L16 (default), G722: payload_type, clock_rate, frame_ticks, frame_bytes }
+```
+
+How it works, and the choices:
+
+- **The algorithm.** A 24-tap quadrature mirror filter splits 16 kHz into
+  two 8 kHz bands. The lower band is coded by ADPCM with a 60-level
+  quantizer (6 bits), the higher by a 4-level one (2 bits). Each band has
+  a 2-pole, 6-zero adaptive predictor and a scale factor adapted in the
+  log domain, both backward-adaptive, so nothing but the codes is sent.
+  The lower band's predictor adapts on its top 4 bits only, so a decoder
+  using 5 or 4 (`Mode`) stays in step with the encoder; RTP uses all 6.
+- **Written from the Recommendation**, not ported: the ITU-T reference
+  implementation is under a copyleft licence this crate's can't take.
+  The tables and fixed-point steps are the Recommendation's; the code is
+  new. The reference is used only as a test oracle, outside the
+  repository.
+- **Bit-exact** with that reference, for 16-bit samples as it scales them
+  (the QMF analysis shifts by 14 and limits to 15 bits, the synthesis
+  shifts by 11 and saturates). ffmpeg's G.722 matches the reference except
+  in two places: its encoder doesn't limit the QMF outputs to 15 bits (it
+  matters near full scale), and its predictor saturates the zero section's
+  running sum once at the end rather than after every term (it matters for
+  rare code patterns). This crate follows the reference.
+- **Cost, and what made it cheaper.** Bit-exact rewrites cut it by a third
+  on ARMv6-M, from about 445,000 instructions a frame both ways to about
+  294,000:
+  - the QMF history is a ring written twice over, so the filter reads 24
+    contiguous samples without shifting them every sample;
+  - the delay lines hold their values doubled and saturated, which is
+    the only way the predictor uses them (doubling keeps the sign, which is
+    all the adaptation looks at);
+  - the zero section adapts, shifts and predicts in one pass;
+  - saturations that the operands' ranges make impossible are dropped,
+    and debug builds check those ranges in every test.
+
+  A binary search for the lower band's quantizer level was slower: the
+  scale factor tracks the signal, so the linear search stops early.
+- **State and loss.** About 400 bytes each for the encoder and decoder,
+  carried from frame to frame. A lost frame is concealed in samples
+  (`Concealer::play_decoded`) and decoding carries on. The decoder, having
+  missed a frame, has adapted differently from the encoder: measured, it
+  is within 30 dB of a decoder that didn't miss it about 100 ms later, and
+  identical again some hundreds of milliseconds after that. ITU-T G.722
+  appendices III and IV specify better concealment; redundancy (`red`)
+  avoids the drift altogether.
+- **Quality**, measured on sine waves: 36 to over 60 dB of signal to noise
+  below 4 kHz, about 20 to 26 dB in the higher band, and 22 samples
+  (1.4 ms) of delay.
+- **RTP.** RFC 3551 §4.5.2 gives G.722 an 8000 Hz RTP clock, although it
+  samples at 16 kHz, so timestamps step by 160 per 20 ms frame of 160
+  bytes. `profile::Codec::G722` carries that, and `Codec::L16` stays the
+  default.
 
 ### `srtp`
 
@@ -497,6 +576,8 @@ slightly smaller.
 | `Sender` | 24 |
 | Packet buffer | 652 (12 + 640), 662 with SRTP |
 | `red::Encoder<1, 640>` | 664 |
+| `g722::Encoder` / `g722::Decoder` | 400 / 408 |
+| Packet buffer for G.722 | 172 (12 + 160), 182 with SRTP |
 | Packet buffer with redundancy, depth 1 | 1,297 (12 + 4 + 1 + 2 × 640), 1,307 with SRTP |
 | `srtp::Outbound` | 1,760 (1,040 on the RP2040) |
 | `srtp::Inbound` | 3,536 (2,080 on the RP2040) |
@@ -593,6 +674,9 @@ instructions.
 | Redundancy, depth 1: encode with the frame before | 7,680 |
 | Redundancy, depth 1: parse, receive, play | 4,040 |
 | SRTP protect, 1,297 bytes (redundancy, depth 1) | 281,400 |
+| G.722: encode a frame (320 samples to 160 bytes) | 150,640 |
+| G.722: decode a frame | 143,320 |
+| SRTP protect, 172 bytes (G.722) | 37,960 |
 
 A Cortex-M0+ takes one cycle for most instructions and two for loads,
 stores and taken branches, so cycles are roughly 1.3 to 1.6 times these
@@ -608,7 +692,14 @@ its cost is the bigger packet: protecting and unprotecting 1,297 bytes
 instead of 652 adds about 280,000 instructions a frame, doubling the whole
 frame to about 560,000, or 29 to 36% of the CPU. That is over the CI
 budget, which covers the default device without redundancy; a device that
-wants both should consider the cost, or G.722 (#12) to shrink the frames.
+wants both should consider the cost, or G.722 to shrink the frames.
+
+G.722 costs about 294,000 instructions a frame to encode and decode, 15 to
+19% of the CPU, but SRTP on its 172-byte packets costs about 38,000 each
+way instead of 137,000. A whole device frame on G.722 with SRTP comes to
+about 375,000 instructions instead of 280,000: about a third more CPU for a
+quarter of the bandwidth. With redundancy at depth 1 too, the packets are
+337 bytes, still well under L16's 652.
 
 ### Latency budget
 
@@ -789,6 +880,48 @@ because a misreading shared by both halves would pass. See issue #1.
   receiver's whole-frame check, its sequence mapping, block payload type
   filter and wait, and counting copies as late (only after a test for
   copies arriving after their frame played was added).
+- **G.722** (`tests/g722.rs`, #12):
+  - bit-exact with ffmpeg's encoder and decoder, from a fixture of ffmpeg's
+    output for a second of integer-generated audio that drives both bands
+    hard (stopping short of the two extremes where ffmpeg departs from the
+    reference);
+  - encoding and decoding in pieces of any size match doing it in one go;
+  - at 56 and 48 kbit/s the decoder ignores the data bits; a decoder that
+    switches mode stays in step and, once the QMF has flushed, plays
+    exactly what a 64 kbit/s decoder does; each mode costs quality;
+  - the delay is 22 samples; quality on sine waves across the band is above
+    measured thresholds; silence is idle noise of a few steps; full scale
+    doesn't overflow;
+  - after a lost frame, decoding comes within 30 dB by 100 ms and back in
+    step later;
+  - through `Sender`, `Receiver` and `Concealer::play_decoded` on RFC 3551's
+    8 kHz clock, with a lost frame concealed.
+
+  Against the ITU-T reference implementation (`tests/interop.rs`,
+  `itu_reference_*`). It is under its own licence, so it is neither in the
+  repository nor run in CI; build its `g722demo` from
+  <https://github.com/openitu/STL> and set `G722_REFERENCE` and
+  `G722_TEST_DATA` (see the README):
+  - its own test data: a speech file, its encoding, and its decoding in all
+    three modes;
+  - the reference run on full-scale square waves and noise, codes
+    alternating in runs of six, random codes and the fixture's input, in
+    all three modes. The first two are where ffmpeg departs from the
+    reference.
+
+  Interop with ffmpeg: its raw G.722 encoding and decoding match ours bit
+  for bit (on the fixture's input); it sends G.722 over RTP on payload
+  type 9 with one timestamp tick per byte, decoding to exactly our audio;
+  and it decodes our G.722 RTP, described by `G722/8000` SDP, to exactly
+  what our decoder plays.
+
+  Of seventeen bugs planted in the codec, sixteen were caught, three of
+  them only by the reference tests: the two 15-bit limits and the
+  saturating running sum, exactly where ffmpeg departs from the reference,
+  so its fixture can't tell. The survivor drops the multiply's guard for
+  -32768 × -32768: no input found reaches that case (3,000 adversarial code
+  streams and full-scale square waves were tried), so it may be
+  unreachable. The guard stays, as the Recommendation's multiply has it.
 - **Embedded build.** CI runs `cargo build --target thumbv6m-none-eabi`.
 - **Fuzzing (#6).** `cargo fuzz` targets in `fuzz/` for `Packet::parse`,
   `rtcp::Compound::parse` and `red::Payload::parse`: none may panic or hand out a slice outside
@@ -816,13 +949,14 @@ because a misreading shared by both halves would pass. See issue #1.
    from its `cycles` binary.
 6. Redundant audio, RFC 2198 (#11). **Done**: `red`, interoperating with
    GStreamer.
+7. G.722 (#12). **Done**: `g722`, bit-exact with the ITU-T reference and
+   interoperating with ffmpeg.
 
 Further work, by priority:
 
 | Issue | | Priority |
 |---|---|---|
 | #10 | Clock drift by samples, not frames | Medium |
-| #12 | G.722 codec | Low until bandwidth matters |
 | #13 | Packets of varying duration | Low |
 | #14 | Talker information (CSRC, levels) | Low |
 | #15 | End-to-end key agreement for direct calls | Low until needed |
@@ -834,7 +968,7 @@ Further work, by priority:
 |---|---|
 | RTP payload byte order | Big-endian (standard L16), so standard RTP tools interoperate. |
 | RTCP | In v1: SR, RR, SDES and BYE. Optional for devices; the server works without it. |
-| Codec | Raw 16-bit PCM (L16) only. The payload stays opaque, so a codec can be added later without API changes. |
+| Codec | L16 by default; G.722 (#12) for a quarter of the bandwidth, written from the Recommendation and bit-exact with the ITU-T reference. The payload stays opaque to `Receiver` and `Sender`. Opus and other floating-point codecs stay out: too heavy for a Cortex-M0+. |
 | Licence | Dual MIT OR Apache-2.0. |
 | Distribution | Git dependency; not published to crates.io. |
 | Redundancy | RFC 2198 on its own payload type, opt-in per stream. Blocks are placed by sequence number, `k` frames of offset being `k` packets back, so the encoder never carries frames across a silence. |

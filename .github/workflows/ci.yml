@@ -80,7 +80,9 @@ jobs:
           # are root-only.
           sudo chown -R "$USER" ~/apt-cache
           sudo chmod -R u+r ~/apt-cache
-      - run: cargo test --all-features --test interop -- --ignored --test-threads=1
+      # The ITU-T G.722 reference tests need the reference, which isn't
+      # installed here (README, "Testing and conformance").
+      - run: cargo test --all-features --test interop -- --ignored --test-threads=1 --skip itu_reference
 
   # The Pico W intercom firmware (examples/pico-w). It needs hardware to
   # run; CI makes sure it builds, configured and not.

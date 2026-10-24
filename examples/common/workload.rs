@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 use embedded_rtp::duck::{self, Ducker};
+use embedded_rtp::g722;
 use embedded_rtp::jitter::{Config, Playout};
 use embedded_rtp::l16::{self, Concealer};
 use embedded_rtp::packet::{self, Packet};
@@ -47,6 +48,8 @@ pub struct Workload {
     red_encoder: RedEncoder,
     red_receiver: Receiver<8, FRAME_BYTES>,
     red_packet: [u8; RED_BYTES],
+    g722_encoder: g722::Encoder,
+    g722_decoder: g722::Decoder,
 }
 
 fn key(seed: u8) -> MasterKey {
@@ -109,6 +112,8 @@ impl Workload {
             red_receiver: Receiver::new(PAYLOAD_TYPE, TICKS, Config::DEFAULT)
                 .with_redundancy(RED_PAYLOAD_TYPE, 1),
             red_packet: [0; RED_BYTES],
+            g722_encoder: g722::Encoder::new(),
+            g722_decoder: g722::Decoder::new(),
         }
     }
 
@@ -212,6 +217,31 @@ impl Workload {
                 red_receiver.receive(&p, timestamp);
             }
             let _ = red_receiver.play();
+        });
+
+        // G.722 in place of L16: a quarter of the bytes, for the codec's
+        // cost.
+        let g722_encoder = &mut self.g722_encoder;
+        let mut g722_codes = [0u8; FRAME_SAMPLES / 2];
+        time("g722: encode a frame", &mut |_| {
+            g722_encoder.encode(&frame, &mut g722_codes);
+        });
+        // And SRTP on its smaller packet.
+        let mut g722_packet = [0u8; packet::HEADER_LEN + FRAME_SAMPLES / 2 + RTP_OVERHEAD];
+        let g722_len = Sender::new(1, embedded_rtp::g722::PAYLOAD_TYPE, TICKS / 2, 0, 0)
+            .send(&g722_codes, &mut g722_packet)
+            .unwrap();
+        let mut g722_outbound = Outbound::new(&key(8));
+        time("g722: srtp protect_rtp (172 B, and a copy)", &mut |_| {
+            let mut copy = g722_packet;
+            g722_outbound.protect_rtp(&mut copy, g722_len).unwrap();
+            core::hint::black_box(copy);
+        });
+        let g722_decoder = &mut self.g722_decoder;
+        time("g722: decode a frame", &mut |_| {
+            let mut samples = [0i16; FRAME_SAMPLES];
+            g722_decoder.decode(&g722_codes, &mut samples);
+            core::hint::black_box(samples);
         });
 
         let concealer = &mut self.concealer;

@@ -759,6 +759,378 @@ fn ffmpeg_stream_plays_through_receiver_unchanged() {
     assert_eq!(played, input);
 }
 
+/// G.722 against the ITU-T reference implementation's own test data
+/// (G.191's software tool library, `src/g722/test_data`): a speech file,
+/// its encoding, and its decoding at 64, 56 and 48 kbit/s. All bit-exact.
+///
+/// The data is under the library's own licence, so it isn't copied here.
+/// Point `G722_TEST_DATA` at a copy, from <https://github.com/openitu/STL>.
+#[test]
+#[ignore = "needs the ITU-T STL G.722 test data in G722_TEST_DATA"]
+fn itu_reference_g722_vectors() {
+    use embedded_rtp::g722::{Decoder, Encoder, Mode};
+
+    let dir = PathBuf::from(
+        std::env::var_os("G722_TEST_DATA").expect("set G722_TEST_DATA to STL's src/g722/test_data"),
+    );
+    // 16-bit little-endian words; the codes take one word each.
+    let words = |name: &str| -> Vec<i16> {
+        fs::read(dir.join(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .chunks_exact(2)
+            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .collect()
+    };
+    let input = words("inpsp.bin");
+    let codes: Vec<u8> = words("codspw.cod").iter().map(|&w| w as u8).collect();
+    assert_eq!(codes.len() * 2, input.len());
+
+    let mut ours = vec![0u8; codes.len()];
+    Encoder::new().encode(&input, &mut ours);
+    let first = ours.iter().zip(&codes).position(|(a, b)| a != b);
+    assert_eq!(first, None, "first code differing from the reference");
+
+    for (file, mode) in [
+        ("outsp1.bin", Mode::Kbps64),
+        ("outsp2.bin", Mode::Kbps56),
+        ("outsp3.bin", Mode::Kbps48),
+    ] {
+        let expected = words(file);
+        let mut decoded = vec![0i16; expected.len()];
+        Decoder::with_mode(mode).decode(&codes, &mut decoded);
+        let first = decoded.iter().zip(&expected).position(|(a, b)| a != b);
+        assert_eq!(
+            first, None,
+            "{mode:?}: first sample differing from the reference"
+        );
+    }
+}
+
+/// G.722 against the ITU-T reference implementation itself, run on signals
+/// harder than its speech file, in all three decoder modes. All bit-exact.
+///
+/// Two of them find where ffmpeg departs from the reference. Full-scale
+/// square waves and noise drive the QMF outputs past 15 bits, where the
+/// reference limits them and ffmpeg's encoder doesn't. And codes
+/// alternating in runs of six drive the zero predictor's running sum past
+/// 16 bits, which the reference saturates after every term and ffmpeg only
+/// at the end. Random codes and `g722_test_input` complete the set.
+///
+/// Point `G722_REFERENCE` at STL's `g722demo` binary, built from
+/// <https://github.com/openitu/STL> (`cmake --build <dir> --target
+/// g722demo`).
+#[test]
+#[ignore = "needs the ITU-T STL g722demo binary in G722_REFERENCE"]
+fn itu_reference_g722_on_hard_signals() {
+    use embedded_rtp::g722::{Decoder, Encoder, Mode};
+
+    let demo = std::env::var_os("G722_REFERENCE").expect("set G722_REFERENCE to STL's g722demo");
+    let dir = scratch("g722-reference");
+    // g722demo reads and writes native 16-bit words, one per code.
+    let write = |name: &str, words: &[i16]| {
+        let path = dir.join(name);
+        fs::write(
+            &path,
+            words
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        path
+    };
+    let read = |path: &PathBuf| -> Vec<i16> {
+        fs::read(path)
+            .unwrap()
+            .chunks_exact(2)
+            .map(|pair| i16::from_ne_bytes([pair[0], pair[1]]))
+            .collect()
+    };
+    let run = |args: &[&std::ffi::OsStr]| {
+        let status = Command::new(&demo)
+            .arg("-q")
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("could not run g722demo");
+        assert!(status.success());
+    };
+
+    let mut rng = common::Rng::new(9);
+    let random_codes: Vec<u8> = (0..8000).map(|_| rng.next_u32() as u8).collect();
+    let inputs = [
+        ("full-scale", common::g722_full_scale_input()),
+        ("test-input", common::g722_test_input()),
+    ];
+    let alternating: Vec<u8> = (0..4000)
+        .map(|i| if (i / 6) % 2 == 0 { 0x05 } else { 0x21 })
+        .collect();
+    let mut streams = vec![("random", random_codes), ("alternating", alternating)];
+    for (name, input) in inputs {
+        let input_path = write(&format!("{name}.raw"), &input);
+        let codes_path = dir.join(format!("{name}.cod"));
+        run(&[
+            "-enc".as_ref(),
+            input_path.as_os_str(),
+            codes_path.as_os_str(),
+        ]);
+        let reference: Vec<u8> = read(&codes_path).iter().map(|&w| w as u8).collect();
+        let mut ours = vec![0u8; input.len() / 2];
+        Encoder::new().encode(&input, &mut ours);
+        let first = ours.iter().zip(&reference).position(|(a, b)| a != b);
+        assert_eq!(
+            first, None,
+            "{name}: first code differing from the reference"
+        );
+        streams.push((name, reference));
+    }
+    for (name, codes) in streams {
+        let words: Vec<i16> = codes.iter().map(|&c| i16::from(c)).collect();
+        let codes_path = write(&format!("{name}-in.cod"), &words);
+        for (flag, mode) in [
+            ("1", Mode::Kbps64),
+            ("2", Mode::Kbps56),
+            ("3", Mode::Kbps48),
+        ] {
+            let out_path = dir.join(format!("{name}.dec{flag}"));
+            run(&[
+                "-dec".as_ref(),
+                "-mode".as_ref(),
+                flag.as_ref(),
+                codes_path.as_os_str(),
+                out_path.as_os_str(),
+            ]);
+            let reference = read(&out_path);
+            let mut ours = vec![0i16; codes.len() * 2];
+            Decoder::with_mode(mode).decode(&codes, &mut ours);
+            let first = ours.iter().zip(&reference).position(|(a, b)| a != b);
+            assert_eq!(
+                first, None,
+                "{name}, {mode:?}: first sample differing from the reference"
+            );
+        }
+    }
+}
+
+fn ffmpeg_run(args: &[&str]) {
+    let status = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y"])
+        .args(args)
+        .stdin(Stdio::null())
+        .status()
+        .expect("could not run ffmpeg (is it installed?)");
+    assert!(status.success(), "ffmpeg {args:?}");
+}
+
+/// ffmpeg's G.722 encoder and decoder, which are bit-exact with the ITU-T
+/// reference, agree with ours bit for bit on `g722_test_input`. With
+/// `UPDATE_FIXTURES=1` this rewrites `tests/fixtures/ffmpeg-g722.bin`,
+/// which the default run checks against.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn ffmpeg_g722_is_bit_exact_both_ways() {
+    use embedded_rtp::g722::{Decoder, Encoder};
+
+    let dir = scratch("ffmpeg-g722");
+    let input = common::g722_test_input();
+    let raw = dir.join("in.raw");
+    let g722 = dir.join("out.g722");
+    let decoded = dir.join("decoded.raw");
+    fs::write(&raw, l16_bytes(&input)).unwrap();
+    let path = |p: &PathBuf| p.to_str().unwrap().to_owned();
+    ffmpeg_run(&[
+        "-f",
+        "s16be",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        "-i",
+        &path(&raw),
+        "-c:a",
+        "g722",
+        "-f",
+        "g722",
+        &path(&g722),
+    ]);
+    ffmpeg_run(&[
+        "-f",
+        "g722",
+        "-i",
+        &path(&g722),
+        "-f",
+        "s16be",
+        &path(&decoded),
+    ]);
+    let codes = fs::read(&g722).unwrap();
+    let their_samples = l16_samples(&fs::read(&decoded).unwrap());
+
+    let mut ours = vec![0u8; input.len() / 2];
+    Encoder::new().encode(&input, &mut ours);
+    assert_eq!(codes.len(), ours.len());
+    assert!(codes == ours, "ffmpeg's codes differ from ours");
+    let mut our_samples = vec![0i16; codes.len() * 2];
+    Decoder::new().decode(&codes, &mut our_samples);
+    assert!(
+        their_samples == our_samples,
+        "ffmpeg's decoding differs from ours"
+    );
+
+    if std::env::var_os("UPDATE_FIXTURES").is_some() {
+        let mut fixture = codes.clone();
+        fixture.extend(l16_bytes(&their_samples));
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ffmpeg-g722.bin");
+        fs::write(path, fixture).unwrap();
+    }
+}
+
+/// ffmpeg sends G.722 over RTP: static payload type 9, and timestamps on
+/// RFC 3551's 8 kHz clock, one tick per byte although each byte is two
+/// samples. The stream decodes to exactly what our own encoder and decoder
+/// make of the same audio.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn ffmpeg_sends_g722_rtp_we_decode() {
+    use embedded_rtp::g722::{self, Decoder, Encoder};
+
+    let dir = scratch("ffmpeg-g722-send");
+    let input = common::g722_test_input();
+    let raw = dir.join("in.raw");
+    fs::write(&raw, l16_bytes(&input)).unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let url = format!("rtp://127.0.0.1:{}", socket.local_addr().unwrap().port());
+    let ffmpeg = spawn(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-re",
+            "-f",
+            "s16be",
+            "-ar",
+            "16000",
+            "-ac",
+            "1",
+            "-i",
+            raw.to_str().unwrap(),
+            "-c:a",
+            "g722",
+            "-f",
+            "rtp",
+            &url,
+        ],
+    );
+    let mut codes = Vec::new();
+    let mut expected_ts = None;
+    let mut buf = [0u8; 2048];
+    while codes.len() < input.len() / 2 {
+        let (len, _) = socket
+            .recv_from(&mut buf)
+            .expect("ffmpeg stopped sending early");
+        if packet::is_rtcp(&buf[..len]) {
+            continue;
+        }
+        let packet = Packet::parse(&buf[..len]).unwrap();
+        assert_eq!(packet.header.payload_type, g722::PAYLOAD_TYPE);
+        if let Some(ts) = expected_ts {
+            assert_eq!(packet.header.timestamp, ts, "one tick per byte");
+        }
+        expected_ts = Some(
+            packet
+                .header
+                .timestamp
+                .wrapping_add(packet.payload.len() as u32),
+        );
+        codes.extend_from_slice(packet.payload);
+    }
+    drop(ffmpeg);
+
+    let mut ours = vec![0u8; input.len() / 2];
+    Encoder::new().encode(&input, &mut ours);
+    assert!(codes == ours);
+    let mut theirs = vec![0i16; input.len()];
+    Decoder::new().decode(&codes, &mut theirs);
+    let mut again = vec![0i16; input.len()];
+    Decoder::new().decode(&ours, &mut again);
+    assert_eq!(theirs, again);
+}
+
+/// Our G.722 packets, described by an SDP file as `G722/8000` on payload
+/// type 9, decode in ffmpeg to exactly what our decoder makes of them,
+/// across the sequence number and timestamp wraps.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn ffmpeg_decodes_our_g722_rtp() {
+    use embedded_rtp::g722::{self, Decoder, Encoder};
+    use embedded_rtp::profile::Codec;
+
+    let dir = scratch("ffmpeg-g722-receive");
+    let port = free_port_pair();
+    let sdp_path = dir.join("in.sdp");
+    let output_path = dir.join("out.raw");
+    fs::write(
+        &sdp_path,
+        format!(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=embedded-rtp\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\n\
+             m=audio {port} RTP/AVP 9\r\na=rtpmap:9 G722/8000\r\na=ptime:20\r\n"
+        ),
+    )
+    .unwrap();
+    let ffmpeg = spawn(
+        "ffmpeg",
+        &[
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-protocol_whitelist",
+            "file,udp,rtp",
+            "-i",
+            sdp_path.to_str().unwrap(),
+            "-f",
+            "s16be",
+            "-y",
+            output_path.to_str().unwrap(),
+        ],
+    );
+    wait_until_bound(port);
+
+    let codec = Codec::G722;
+    let ticks = codec.frame_ticks();
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut sender = Sender::new(
+        0x6722,
+        g722::PAYLOAD_TYPE,
+        ticks,
+        65_520,
+        u32::MAX - 10 * ticks,
+    );
+    let mut encoder = Encoder::new();
+    let input = common::g722_test_input();
+    let mut codes = Vec::new();
+    for frame in input.chunks(FRAME_SAMPLES) {
+        let mut payload = [0u8; 160];
+        encoder.encode(frame, &mut payload);
+        let mut buf = [0u8; 12 + 160];
+        let len = sender.send(&payload, &mut buf).unwrap();
+        socket.send_to(&buf[..len], ("127.0.0.1", port)).unwrap();
+        codes.extend_from_slice(&payload);
+        sleep(Duration::from_millis(1));
+    }
+    sleep(Duration::from_millis(500));
+    ffmpeg.interrupt();
+
+    let decoded = l16_samples(&fs::read(&output_path).unwrap());
+    let mut expected = vec![0i16; input.len()];
+    Decoder::new().decode(&codes, &mut expected);
+    assert_eq!(decoded.len(), expected.len(), "sample count");
+    assert!(decoded == expected, "ffmpeg's decoding differs from ours");
+}
+
 /// The `red` payload type for the RFC 2198 tests.
 const RED_PAYLOAD_TYPE: u8 = 97;
 
